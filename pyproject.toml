@@ -1,0 +1,85 @@
+[project]
+name = "shopfeed-os"
+version = "1.0.0"
+description = "ShopFeed OS — Commerce Infini Platform inspired by ByteDance/Douyin/TikTok Shop"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+
+dependencies = [
+    # --- Core ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.6",
+
+    # --- Async DB ---
+    "asyncpg>=0.30",
+    "aioredis>=2.0",
+    "redis>=5.2",
+
+    # --- Kafka ---
+    "aiokafka>=0.12",
+    "confluent-kafka>=2.6",
+
+    # --- ML / Deep Learning ---
+    "torch>=2.5",
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "scikit-learn>=1.6",
+    "faiss-cpu>=1.9",
+
+    # --- NLP / Vision ---
+    "sentence-transformers>=3.4",
+    "transformers>=4.48",
+    "open-clip-torch>=2.29",
+    "Pillow>=11.0",
+
+    # --- Search ---
+    "elasticsearch[async]>=8.17",
+
+    # --- Payments ---
+    "stripe>=11.4",
+
+    # --- HTTP ---
+    "httpx>=0.28",
+
+    # --- Monitoring ---
+    "prometheus-client>=0.21",
+    "rich>=13.9",
+
+    # --- WebSocket ---
+    "websockets>=14.1",
+
+    # --- Geo ---
+    "geopy>=2.4",
+
+    # --- Utils ---
+    "orjson>=3.10",
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+    "python-multipart>=0.0.18",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch>=2.5",
+    "triton>=3.1",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,184 @@
+# ShopFeed OS — Kubernetes Manifests
+# Section 11 — Stack Technique
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  labels:
+    app: shopfeed
+    service: api-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      service: api-gateway
+  template:
+    metadata:
+      labels:
+        service: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: shopfeed/api-gateway:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shopfeed-secrets
+                  key: jwt-secret
+            - name: REDIS_URL
+              value: redis://redis-rate:6381/0
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feed-service
+  labels:
+    app: shopfeed
+    service: feed-service
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      service: feed-service
+  template:
+    metadata:
+      labels:
+        service: feed-service
+    spec:
+      containers:
+        - name: feed-service
+          image: shopfeed/feed-service:latest
+          ports:
+            - containerPort: 8001
+          env:
+            - name: REDIS_URL
+              value: redis://redis-session:6379/0
+            - name: KAFKA_BOOTSTRAP
+              value: kafka:9092
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-service
+  labels:
+    app: shopfeed
+    service: live-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      service: live-service
+  template:
+    metadata:
+      labels:
+        service: live-service
+    spec:
+      containers:
+        - name: live-service
+          image: shopfeed/live-service:latest
+          ports:
+            - containerPort: 8002
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+
+---
+# HPA for Feed Service (most critical for latency)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: feed-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: feed-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: http_request_duration_seconds
+        target:
+          type: AverageValue
+          averageValue: "80m"   # Scale up when >80ms p95
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shopfeed-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/websocket-services: "live-service,feed-service"
+spec:
+  rules:
+    - host: api.shopfeed.io
+      http:
+        paths:
+          - path: /api/v1/feed
+            pathType: Prefix
+            backend:
+              service:
+                name: feed-service
+                port:
+                  number: 8001
+          - path: /ws/
+            pathType: Prefix
+            backend:
+              service:
+                name: live-service
+                port:
+                  number: 8002
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8000

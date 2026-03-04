@@ -1,0 +1,71 @@
+# ShopFeed OS — Kafka Topic Definitions
+# Section 14 — 8 topics
+
+# ──────────────────────────────────────────────────────────
+# Topic specifications
+# ──────────────────────────────────────────────────────────
+
+topics:
+  # User behavioral events (feed interactions)
+  - name: shopfeed.user.events
+    partitions: 12
+    replication: 3
+    retention_ms: 604800000   # 7 days
+    key: user_id
+    description: "Feed interactions: view, pause, zoom, skip, share, save"
+
+  # Commerce events (cart, purchase)
+  - name: shopfeed.commerce.events
+    partitions: 12
+    replication: 3
+    retention_ms: 2592000000  # 30 days
+    key: user_id
+    description: "Commerce funnel: view_product, add_to_cart, buy_now, checkout, order"
+
+  # Vendor lifecycle events
+  - name: shopfeed.vendor.events
+    partitions: 6
+    replication: 3
+    retention_ms: 2592000000  # 30 days
+    key: vendor_id
+    description: "Vendor actions: product_published, live_started, flash_sale"
+
+  # Live commerce events
+  - name: shopfeed.live.events
+    partitions: 12
+    replication: 3
+    retention_ms: 604800000   # 7 days
+    key: live_id
+    description: "Live: join, leave, comment, gift, product_click, buy_now"
+
+  # Order created → triggers GeoSort
+  - name: shopfeed.orders.created
+    partitions: 6
+    replication: 3
+    retention_ms: 2592000000  # 30 days
+    key: order_id
+    description: "New orders → consumed by GeoSort for classification"
+
+  # ML feature updates
+  - name: shopfeed.ml.features
+    partitions: 6
+    replication: 3
+    retention_ms: 86400000    # 1 day
+    key: entity_id
+    description: "Feature store updates for online training (Monolith)"
+
+  # Notification dispatch
+  - name: shopfeed.notifications.send
+    partitions: 6
+    replication: 3
+    retention_ms: 86400000    # 1 day
+    key: user_id
+    description: "Notification dispatch: push, in-app, live reminders"
+
+  # Search index updates
+  - name: shopfeed.search.index
+    partitions: 3
+    replication: 3
+    retention_ms: 604800000   # 7 days
+    key: product_id
+    description: "Product index updates for Elasticsearch sync"

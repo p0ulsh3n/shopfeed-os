@@ -1,0 +1,68 @@
+# ──────────────────────────────────────────────────────────
+# ShopFeed OS — Requirements (GPU Training + API Serving)
+# ──────────────────────────────────────────────────────────
+
+# ── Core Framework ───────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+python-multipart>=0.0.12
+orjson>=3.10.0
+
+# ── ML / Deep Learning ──────────────────────────────────
+torch>=2.5.0
+numpy>=1.26.0
+scipy>=1.14.0
+scikit-learn>=1.5.0
+
+# ── HuggingFace Ecosystem ───────────────────────────────
+transformers>=4.46.0
+sentence-transformers>=3.3.0
+datasets>=3.1.0          # HuggingFace datasets (Alibaba, Amazon, etc.)
+huggingface-hub>=0.26.0
+peft>=0.13.0             # LoRA / QLoRA fine-tuning
+accelerate>=1.1.0        # Multi-GPU training
+
+# ── Vision Models ───────────────────────────────────────
+open-clip-torch>=2.26.0  # FashionSigLIP, FashionCLIP
+timm>=1.0.0              # Pretrained vision models (ViT, etc.)
+pillow>=10.4.0
+
+# ── Vector Search ───────────────────────────────────────
+faiss-cpu>=1.9.0         # CPU FAISS (use faiss-gpu on GPU servers)
+
+# ── Async Database ──────────────────────────────────────
+asyncpg>=0.30.0          # PostgreSQL async
+redis[hiredis]>=5.2.0    # Redis with C parser
+aiokafka>=0.12.0         # Kafka async producer/consumer
+pgvector>=0.3.0          # PostgreSQL pgvector extension
+
+# ── Search ──────────────────────────────────────────────
+elasticsearch[async]>=8.16.0
+
+# ── Auth & Security ─────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# ── HTTP & Networking ───────────────────────────────────
+httpx>=0.27.0
+websockets>=13.1
+
+# ── Monitoring ──────────────────────────────────────────
+prometheus-client>=0.21.0
+
+# ── CLI & Display ───────────────────────────────────────
+rich>=13.9.0
+click>=8.1.0
+
+# ── ONNX Export (for TorchServe / Triton) ───────────────
+onnx>=1.17.0
+onnxruntime>=1.20.0
+
+# ── Audio (VGGish embeddings — Section 16) ──────────────
+torchaudio>=2.5.0
+
+# ── Distributed Training (Monolith 2026 stack) ─────────
+ray[train]>=2.40.0        # Distributed training (replaces PS)
+tritonclient[all]>=2.51.0 # Triton Inference Server client
+
