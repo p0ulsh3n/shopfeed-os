@@ -4,167 +4,19 @@ Each factory is lazy, async, and supports graceful fallback
 when infrastructure is unavailable (dev/test mode).
 """
 
-from __future__ import annotations
+from .kafka import LogKafkaProducer, get_kafka_producer, publish_event
+from .postgres import get_pg_pool
+from .redis import InMemoryPipeline, InMemoryRedis, get_redis
 
-import asyncio
-import json
-import logging
-import os
-from typing import Any
-
-logger = logging.getLogger(__name__)
-
-# ──────────────────────────────────────────────────────────────
-# Settings
-# ──────────────────────────────────────────────────────────────
-
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://shopfeed:shopfeed@localhost:5432/shopfeed")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-
-
-# ──────────────────────────────────────────────────────────────
-# Redis
-# ──────────────────────────────────────────────────────────────
-
-_redis_pool = None
-
-
-async def get_redis():
-    """Get or create async Redis connection pool."""
-    global _redis_pool
-    if _redis_pool is not None:
-        return _redis_pool
-    try:
-        import redis.asyncio as aioredis
-        _redis_pool = aioredis.from_url(REDIS_URL, decode_responses=True)
-        await _redis_pool.ping()
-        logger.info("Redis connected: %s", REDIS_URL)
-        return _redis_pool
-    except Exception as exc:
-        logger.warning("Redis unavailable (%s), using in-memory fallback", exc)
-        _redis_pool = InMemoryRedis()
-        return _redis_pool
-
-
-class InMemoryRedis:
-    """In-memory Redis fallback for dev/test environments."""
-
-    def __init__(self):
-        self._store: dict[str, Any] = {}
-        self._ttls: dict[str, float] = {}
-
-    async def get(self, key: str) -> str | None:
-        return self._store.get(key)
-
-    async def set(self, key: str, value: str, ex: int | None = None) -> None:
-        self._store[key] = value
-
-    async def hgetall(self, key: str) -> dict:
-        val = self._store.get(key, {})
-        return val if isinstance(val, dict) else {}
-
-    async def hset(self, key: str, mapping: dict) -> None:
-        self._store[key] = mapping
-
-    async def delete(self, *keys: str) -> None:
-        for k in keys:
-            self._store.pop(k, None)
-
-    async def smembers(self, key: str) -> set:
-        val = self._store.get(key, set())
-        return val if isinstance(val, set) else set()
-
-    async def sadd(self, key: str, *members: str) -> None:
-        if key not in self._store:
-            self._store[key] = set()
-        self._store[key].update(members)
-
-    async def ping(self) -> bool:
-        return True
-
-    def pipeline(self, transaction: bool = False):
-        return InMemoryPipeline(self)
-
-
-class InMemoryPipeline:
-    def __init__(self, redis: InMemoryRedis):
-        self._redis = redis
-        self._commands: list = []
-
-    def get(self, key: str):
-        self._commands.append(("get", key))
-        return self
-
-    async def execute(self) -> list:
-        results = []
-        for cmd, key in self._commands:
-            if cmd == "get":
-                results.append(await self._redis.get(key))
-        self._commands.clear()
-        return results
-
-
-# ──────────────────────────────────────────────────────────────
-# Kafka Producer
-# ──────────────────────────────────────────────────────────────
-
-_kafka_producer = None
-
-
-async def get_kafka_producer():
-    """Get or create async Kafka producer."""
-    global _kafka_producer
-    if _kafka_producer is not None:
-        return _kafka_producer
-    try:
-        from aiokafka import AIOKafkaProducer
-        _kafka_producer = AIOKafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP,
-            value_serializer=lambda v: json.dumps(v, default=str).encode(),
-        )
-        await _kafka_producer.start()
-        logger.info("Kafka producer connected: %s", KAFKA_BOOTSTRAP)
-        return _kafka_producer
-    except Exception as exc:
-        logger.warning("Kafka unavailable (%s), using log fallback", exc)
-        _kafka_producer = LogKafkaProducer()
-        return _kafka_producer
-
-
-class LogKafkaProducer:
-    """Fallback Kafka producer that logs events (dev/test)."""
-
-    async def send_and_wait(self, topic: str, value: dict, key: bytes | None = None):
-        logger.debug("KAFKA[%s] %s", topic, json.dumps(value, default=str)[:200])
-
-    async def stop(self):
-        pass
-
-
-async def publish_event(topic: str, event_data: dict) -> None:
-    """Publish an event to a Kafka topic (or log fallback)."""
-    producer = await get_kafka_producer()
-    await producer.send_and_wait(topic, event_data)
-
-
-# ──────────────────────────────────────────────────────────────
-# PostgreSQL
-# ──────────────────────────────────────────────────────────────
-
-_pg_pool = None
-
-
-async def get_pg_pool():
-    """Get or create async PostgreSQL connection pool."""
-    global _pg_pool
-    if _pg_pool is not None:
-        return _pg_pool
-    try:
-        import asyncpg
-        _pg_pool = await asyncpg.create_pool(POSTGRES_DSN, min_size=2, max_size=20)
-        logger.info("PostgreSQL pool created: %s", POSTGRES_DSN.split("@")[-1])
-        return _pg_pool
-    except Exception as exc:
-        logger.warning("PostgreSQL unavailable (%s)", exc)
-        return None
+__all__ = [
+    # Redis
+    "get_redis",
+    "InMemoryRedis",
+    "InMemoryPipeline",
+    # Kafka
+    "get_kafka_producer",
+    "publish_event",
+    "LogKafkaProducer",
+    # PostgreSQL
+    "get_pg_pool",
+]
