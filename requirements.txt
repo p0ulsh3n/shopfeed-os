@@ -11,7 +11,7 @@ orjson>=3.10.0
 
 # ── ML / Deep Learning ──────────────────────────────────
 torch>=2.5.0
-numpy>=1.26.0
+numpy>=2.1.0         # BUG #17 FIX: aligned with pyproject.toml (was >=1.26, NumPy 2.x has breaking changes)
 scipy>=1.14.0
 scikit-learn>=1.5.0
 

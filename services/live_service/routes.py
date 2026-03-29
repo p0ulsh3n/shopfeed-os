@@ -15,7 +15,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ShopFeed OS — Live Service", version="1.0.0")
 
-manager = LiveConnectionManager()
+# BUG #S5 FIX: LiveConnectionManager now accepts a redis_client for
+# cross-replica pub/sub. Injected at startup from app.state.redis.
+# Falls back to in-memory if Redis is unavailable (single-pod mode).
+manager = LiveConnectionManager(redis_client=None)
+
+
+@app.on_event("startup")
+async def _inject_redis() -> None:
+    """Wire shared Redis client into the connection manager at startup."""
+    redis = getattr(app.state, "redis", None)
+    if redis is not None:
+        manager.redis = redis
+        logger.info("LiveConnectionManager: Redis pub/sub active (multi-replica safe)")
+    else:
+        logger.warning(
+            "LiveConnectionManager: no Redis — single-pod in-memory mode only. "
+            "WebSocket broadcast will NOT work across k8s replicas."
+        )
 
 # In-memory live sessions (would be PostgreSQL in production)
 _live_sessions: dict[str, dict] = {}
@@ -57,7 +74,8 @@ async def create_live(req: CreateLiveRequest):
 async def get_live_metrics(live_id: str):
     """Get current live metrics."""
     metrics = _live_metrics.get(live_id, {})
-    concurrent = manager.get_viewer_count(live_id)
+    # BUG #S5 FIX: get_viewer_count is now async (checks Redis)
+    concurrent = await manager.get_viewer_count(live_id)
 
     return LiveMetricsResponse(
         concurrent_viewers=concurrent,
@@ -68,10 +86,9 @@ async def get_live_metrics(live_id: str):
     )
 
 
-def _compute_live_score(live_id: str) -> float:
+def _compute_live_score(live_id: str, concurrent: int = 0) -> float:
     """Section 07 — LiveScore formula, updated every 60s."""
     m = _live_metrics.get(live_id, {})
-    concurrent = manager.get_viewer_count(live_id)
     peak = m.get("peak_viewers", 0)
 
     elapsed_min = max((time.time() - _live_sessions.get(live_id, {}).get("started_at", time.time())) / 60.0, 1.0)
@@ -101,7 +118,8 @@ async def vendor_live_ws(websocket: WebSocket, live_id: str):
     try:
         while True:
             metrics = _live_metrics.get(live_id, {})
-            concurrent = manager.get_viewer_count(live_id)
+            # BUG #S5 FIX: await async get_viewer_count
+            concurrent = await manager.get_viewer_count(live_id)
 
             # Update peak
             if concurrent > metrics.get("peak_viewers", 0):
@@ -116,13 +134,13 @@ async def vendor_live_ws(websocket: WebSocket, live_id: str):
                     "buy_now_per_min": metrics.get("buy_now_count", 0) / max(1, (time.time() - _live_sessions.get(live_id, {}).get("started_at", time.time())) / 60.0),
                     "items_sold": metrics.get("items_sold", 0),
                     "ctr_product": (metrics.get("product_clicks", 0) / max(1, concurrent)) if concurrent else 0,
-                    "live_score": _compute_live_score(live_id),
+                    "live_score": _compute_live_score(live_id, concurrent),
                     "comments": metrics.get("comments", 0),
                 },
             })
             await asyncio.sleep(5)
     except WebSocketDisconnect:
-        manager.disconnect(websocket, room)
+        await manager.disconnect_async(websocket, room)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -177,5 +195,5 @@ async def viewer_live_ws(websocket: WebSocket, live_id: str):
                 })
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, room)
+        await manager.disconnect_async(websocket, room)
         logger.info("Viewer left live=%s", live_id)

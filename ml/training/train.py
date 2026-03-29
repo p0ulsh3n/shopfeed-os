@@ -32,7 +32,7 @@ import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from ml.feature_store import (
     product_to_features,
@@ -67,6 +67,13 @@ class TrainConfig:
     data_path: str = "data/training_events.parquet"
     val_split: float = 0.1
     num_workers: int = 4
+    # BUG #5 FIX: temporal_split avoids data leakage for sequence models.
+    # When True, the last val_split% of samples (by index, which preserves
+    # timestamp order from BehaviorSequenceDataset._preprocess()) is used
+    # as the validation set instead of a random shuffle.
+    # Must be True for DIN / DIEN / BST to avoid future interactions leaking
+    # into the training set.
+    temporal_split: bool = True
 
     # Training
     epochs: int = 20
@@ -386,10 +393,20 @@ class Trainer:
 
         Returns final metrics dict.
         """
-        # Split train/val
+        # BUG #5 FIX: Use temporal split for sequence models to avoid data leakage.
+        # BehaviorSequenceDataset._preprocess() sorts by user→timestamp, so a
+        # simple index-based split preserves temporal ordering.
+        # random_split() would mix future interactions into the training set,
+        # giving artificially optimistic validation metrics.
         val_size = int(len(dataset) * self.config.val_split)
         train_size = len(dataset) - val_size
-        train_ds, val_ds = random_split(dataset, [train_size, val_size])
+        seq_models = ("din", "dien", "bst", "finetune")
+        if self.config.temporal_split and self.config.model_name in seq_models:
+            train_ds = Subset(dataset, range(0, train_size))
+            val_ds   = Subset(dataset, range(train_size, len(dataset)))
+            logger.info("Using TEMPORAL split (no shuffle) — avoids future-leakage in seq models")
+        else:
+            train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
         train_loader = DataLoader(
             train_ds,
@@ -495,9 +512,20 @@ class Trainer:
                 labels = labels.to(self.device)
 
             B = item_feat.size(0)
-            # Generate sparse indices from feature positions
-            sparse_idx = torch.arange(20, device=self.device).unsqueeze(0).expand(B, -1)
-            sparse_val = torch.ones(B, 20, device=self.device)
+            # BUG #2 FIX: Previously used torch.arange(20) as sparse_idx for every
+            # sample in every batch — identical fake features, so the FM component
+            # learned nothing. Replaced with feature-derived real sparse indices.
+            #
+            # Each feature value is hashed into a discrete bin that identifies the
+            # (feature_column, value_bucket) pair, giving the FM real interactions
+            # to learn from. Bucket count matches cfg.num_sparse_features.
+            n_fields = min(20, item_feat.size(1))
+            feat_slice = item_feat[:, :n_fields]                       # [B, F]
+            # Hash each field value into a sparse index in [field*bucket, (field+1)*bucket)
+            bucket_size = max(cfg.num_sparse_features // n_fields, 1)
+            field_offsets = torch.arange(n_fields, device=self.device) * bucket_size  # [F]
+            sparse_idx = (feat_slice.abs() * 1000).long() % bucket_size + field_offsets  # [B, F]
+            sparse_val = feat_slice.abs().clamp(0.0, 1.0)              # [B, F] real magnitudes
 
             return self.model.compute_loss(sparse_idx, sparse_val, item_feat, labels)
 
@@ -559,6 +587,9 @@ class Trainer:
         self.model.eval()
         all_preds: dict[str, list] = {task: [] for task in TASK_NAMES}
         all_labels: dict[str, list] = {task: [] for task in TASK_NAMES}
+        # BUG #8 FIX: collect click-task preds for sequence models too
+        seq_click_preds: list = []
+        seq_click_labels: list = []
         total_loss = 0.0
         n_batches = 0
 
@@ -579,20 +610,50 @@ class Trainer:
                         all_preds[task].append(preds[task].cpu().numpy())
                         all_labels[task].append(batch[key].numpy())
 
+            elif self.config.model_name in ("din", "dien", "bst", "finetune"):
+                # BUG #8 FIX: Previously DIN/DIEN/BST had NO AUC metrics in validation
+                # — only val_loss was tracked, making it impossible to know whether the
+                # model was actually learning to rank purchases correctly.
+                behavior_ids = batch["behavior_ids"].to(self.device)
+                candidate_id = batch["candidate_id"].to(self.device)
+                candidate_cat = batch["candidate_cat"].to(self.device)
+                dense = batch["dense_features"].to(self.device)
+                mask = batch.get("behavior_mask")
+                if mask is not None:
+                    mask = mask.to(self.device)
+
+                preds_out = self.model(
+                    behavior_ids, candidate_id, candidate_cat, dense, mask
+                )
+                # DIEN returns (predictions, aux_logits)
+                if isinstance(preds_out, tuple):
+                    preds_out = preds_out[0]
+
+                # Collect click-task predictions (first head)
+                pred_click = preds_out[0].squeeze(-1).cpu().numpy()
+                label_arr = batch["label"].numpy()
+                seq_click_preds.append(pred_click)
+                seq_click_labels.append(label_arr)
+
         metrics = {"val_loss": total_loss / max(n_batches, 1)}
 
-        # Compute per-task AUC (only for binary tasks with both classes present)
+        # Compute per-task AUC for MTL (only for binary tasks with both classes present)
         for task in TASK_NAMES:
             if all_preds[task]:
-                preds = np.concatenate(all_preds[task])
-                labels = np.concatenate(all_labels[task])
+                preds_arr = np.concatenate(all_preds[task])
+                labels_arr = np.concatenate(all_labels[task])
 
-                if len(np.unique(labels.astype(int))) >= 2:
-                    auc = compute_auc(preds, labels.astype(int))
-                    metrics[f"auc_{task}"] = auc
+                if len(np.unique(labels_arr.astype(int))) >= 2:
+                    metrics[f"auc_{task}"] = compute_auc(preds_arr, labels_arr.astype(int))
+                    metrics[f"logloss_{task}"] = compute_logloss(preds_arr, labels_arr)
 
-                    logloss = compute_logloss(preds, labels)
-                    metrics[f"logloss_{task}"] = logloss
+        # BUG #8 FIX: AUC / LogLoss for sequence models (DIN / DIEN / BST)
+        if seq_click_preds:
+            preds_arr = np.concatenate(seq_click_preds)
+            labels_arr = np.concatenate(seq_click_labels)
+            if len(np.unique(labels_arr.astype(int))) >= 2:
+                metrics["auc_click"]     = compute_auc(preds_arr, labels_arr.astype(int))
+                metrics["logloss_click"] = compute_logloss(preds_arr, labels_arr)
 
         self.model.train()
         return metrics

@@ -126,6 +126,8 @@ class MonolithStreamingTrainer:
         self._events_processed = 0
         self._total_events = 0
         self._running = False
+        # BUG #14 FIX: track how many micro-batches have accumulated
+        self._accum_steps = 0
 
         logger.info(
             "MonolithStreamingTrainer initialized — "
@@ -154,6 +156,14 @@ class MonolithStreamingTrainer:
 
         This is where the actual gradient computation happens.
         Each event contributes to the delta model and item embedding updates.
+
+        Gradient accumulation: optimizer.step() is called only every
+        cfg.gradient_accumulation micro-batches, allowing the model to
+        accumulate gradients across multiple Kafka message windows before
+        updating weights (reduces optimizer noise from small batches).
+
+        Note: Cuckoo table item embeddings are updated immediately per-event
+        (online SGD), independent of the delta_model accumulation schedule.
         """
         if not self._event_buffer:
             return
@@ -173,16 +183,21 @@ class MonolithStreamingTrainer:
                 continue
 
             # ── Get or create item embedding ──
-            item_emb = self.embedding_table.get(item_id)
-            if item_emb is None:
+            stored_emb = self.embedding_table.get(item_id)
+            if stored_emb is None:
                 clip_data = event.get("clip_embedding")
                 clip_tensor = torch.tensor(clip_data, dtype=torch.float32) if clip_data else None
                 init_emb = torch.randn(cfg.embed_dim) * 0.01
                 self.embedding_table.put(item_id, init_emb, initial_clip=clip_tensor)
-                item_emb = self.embedding_table.get(item_id)
+                stored_emb = self.embedding_table.get(item_id)
 
-            if item_emb is None:
+            if stored_emb is None:
                 continue
+
+            # BUG #1 FIX: The stored embedding is a detached clone (requires_grad=False).
+            # We must create a new leaf tensor with requires_grad=True so that
+            # loss.backward() can compute gradients for the embedding update.
+            item_emb = stored_emb.detach().requires_grad_(True)
 
             # ── Compute label from action ──
             weight = ACTION_WEIGHTS.get(action, 0.5)
@@ -207,21 +222,27 @@ class MonolithStreamingTrainer:
             batch_loss += loss.item()
             n_valid += 1
 
-            # ── Update item embedding via gradient ──
+            # BUG #1 FIX: item_emb.grad is now guaranteed non-None after backward()
+            # because item_emb was created as a leaf tensor with requires_grad=True.
             if item_emb.grad is not None:
                 self.embedding_table.update_embedding(
                     item_id, item_emb.grad, lr=cfg.learning_rate,
                 )
-                item_emb.grad = None
 
             # ── Handle stock events ──
             if action == "stock_update" and event.get("stock", 1) <= 0:
                 self.embedding_table.mark_inactive(item_id)
 
-        # ── Optimizer step (gradient accumulation) ──
+        # BUG #14 FIX: Real gradient accumulation.
+        # Only call optimizer.step() every cfg.gradient_accumulation micro-batches.
+        # This is distinct from the event buffer size — the optimizer accumulates
+        # gradients across N consecutive Kafka windows before each weight update.
         if n_valid > 0:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            self._accum_steps += 1
+            if self._accum_steps >= cfg.gradient_accumulation:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self._accum_steps = 0
 
         avg_loss = batch_loss / max(n_valid, 1)
         self._event_buffer.clear()
@@ -229,7 +250,15 @@ class MonolithStreamingTrainer:
         # ── Periodic sync to Redis ──
         now = time.time()
         if now - self._last_sync > cfg.sync_interval_s:
-            asyncio.create_task(self._sync_to_redis()) if asyncio.get_event_loop().is_running() else None
+            # BUG #13 FIX: asyncio.get_event_loop() is deprecated in Python 3.10+.
+            # Use get_running_loop() which raises RuntimeError if not in async context.
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._sync_to_redis())
+            except RuntimeError:
+                # Not in an async context (e.g., called from sync test or CLI).
+                # Sync will be handled by sync_to_redis_blocking() or next async run().
+                logger.debug("Redis sync deferred — not in async context")
             self._last_sync = now
 
         # ── Periodic checkpoint ──

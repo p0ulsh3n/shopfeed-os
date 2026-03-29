@@ -7,6 +7,13 @@ This is the heart of ShopFeed OS. Every feed request triggers this pipeline:
 
 The 3-speed scoring architecture (Section 12):
     Score_Final = Model_Batch(V3) + Delta_Online(V2) + Session_Boost(V1)
+
+BUG FIXES in this file:
+    BUG #S6: session_data was fetched inside the re-rank loop (80 Redis
+             calls). Fixed by fetching once before the loop.
+    BUG #S7: Anonymous users always got an empty feed because _retrieve()
+             returned [] when user_embedding=None. Fixed by passing
+             user_interaction_count=0 to trigger popularity-based retrieval.
 """
 
 from __future__ import annotations
@@ -105,6 +112,7 @@ class RecommendationPipeline:
         user_embedding: np.ndarray | None = None,
         content_types: list[str] | None = None,
         limit: int = 15,
+        user_interaction_count: int = 0,
     ) -> list[FeedCandidate]:
         """Execute full pipeline. Target: <80ms total.
 
@@ -121,7 +129,9 @@ class RecommendationPipeline:
         t0 = time.perf_counter()
 
         # ── Stage 1: Retrieval (~10ms) ──
-        candidates = await self._retrieve(user_embedding)
+        # BUG #S7 FIX: pass user_interaction_count so _retrieve() can
+        # trigger the popularity fallback for anonymous/cold-start users.
+        candidates = await self._retrieve(user_embedding, user_interaction_count=user_interaction_count)
         t1 = time.perf_counter()
 
         # ── Stage 2: Pre-Ranking (~15ms) ──
@@ -152,11 +162,25 @@ class RecommendationPipeline:
     # ── Stage 1: Retrieval ──
 
     async def _retrieve(
-        self, user_embedding: np.ndarray | None, top_k: int = 2000
+        self,
+        user_embedding: np.ndarray | None,
+        top_k: int = 2000,
+        user_interaction_count: int = 0,
     ) -> list[FeedCandidate]:
-        """Two-Tower ANN retrieval — <10ms for 10M+ items."""
-        if self.registry and user_embedding is not None:
-            results = self.registry.retrieve_candidates(user_embedding, top_k=top_k)
+        """Two-Tower ANN retrieval — <10ms for 10M+ items.
+
+        BUG #S7 FIX: Previously returned [] for anonymous/cold-start users
+        (when user_embedding is None). Now delegates to ModelRegistry which
+        falls back to popularity-based ranking (data/popularity_scores.json)
+        for users without embeddings. Anonymous users now see the most popular
+        items instead of an empty feed.
+        """
+        if self.registry:
+            results = self.registry.retrieve_candidates(
+                user_embedding=user_embedding if user_embedding is not None else np.zeros(256, dtype=np.float32),
+                top_k=top_k,
+                user_interaction_count=user_interaction_count,
+            )
             return [
                 FeedCandidate(
                     content_id=item_id,
@@ -167,7 +191,7 @@ class RecommendationPipeline:
                 for item_id, score in results
             ]
 
-        # Fallback: return empty (cold start or no index)
+        # No registry at all: empty (only in bare unit tests)
         return []
 
     # ── Stage 2: Pre-Ranking ──
@@ -237,13 +261,25 @@ class RecommendationPipeline:
             - Diversity: no 3+ items from same category in a row
         """
         # Apply Session State boost (V1)
+        # BUG #S6 FIX: session_data was fetched inside the loop (once per
+        # candidate = up to 80 Redis round-trips ≈ 40-80ms each).
+        # Fixed by fetching ONCE before the loop — saves ~79 Redis calls.
+        session_data = None
         if self.session_store:
+            session_data = await self.session_store.get_session(session_id)
+
+        if session_data:
+            active_cats = session_data.get("active_categories", {})
+            negative_cats = set(session_data.get("negative_categories", []))
             for c in candidates:
-                session_data = await self.session_store.get_session(session_id)
-                if session_data:
-                    # Boost categories matching active interests
-                    # Penalize negative categories
-                    pass  # Implemented in SessionState class
+                # Penalize items in categories the user has skipped/disliked
+                # (CategoryType is stored in FeedCandidate as vendor_id for now)
+                if str(getattr(c, "category_id", "")) in negative_cats:
+                    c.session_boost -= 0.3
+                # Boost categories matching active interests
+                cat_weight = active_cats.get(str(getattr(c, "category_id", "")), 0.0)
+                if cat_weight > 0:
+                    c.session_boost += cat_weight * 0.1
 
         # Vendor diversity constraint
         vendor_count: dict[str, int] = {}

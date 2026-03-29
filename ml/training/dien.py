@@ -147,6 +147,15 @@ class DIENModel(nn.Module):
         # Interest Extractor (GRU + auxiliary loss)
         self.interest_extractor = InterestExtractor(embed_dim, hidden_size)
 
+        # BUG #11 FIX: Replaced the ad-hoc torch.eye() projection (a fixed truncated
+        # identity matrix) with a proper registered nn.Linear so the projection is
+        # actually learned during training. Previously, if embed_dim != hidden_size,
+        # the projection was recreated on every forward pass as a non-parameter tensor.
+        if embed_dim != hidden_size:
+            self.cand_proj: nn.Module = nn.Linear(embed_dim, hidden_size, bias=False)
+        else:
+            self.cand_proj = nn.Identity()
+
         # Attention for AUGRU: compute attention between each hidden state and candidate
         self.attention_mlp = nn.Sequential(
             nn.Linear(hidden_size * 3, 64),  # [h_t, candidate, h_t*candidate]
@@ -227,14 +236,9 @@ class DIENModel(nn.Module):
         hidden_states, aux_logits = self.interest_extractor(behavior_emb)  # [B, T, H]
 
         # Attention scores for AUGRU (candidate-aware per timestep)
-        # Project candidate to hidden_size if dimensions differ
-        if candidate_emb.shape[-1] != self.hidden_size:
-            cand_proj = F.linear(
-                candidate_emb,
-                torch.eye(self.hidden_size, self.embed_dim, device=candidate_emb.device),
-            )
-        else:
-            cand_proj = candidate_emb
+        # BUG #11 FIX: use the registered nn.Linear / nn.Identity projection
+        # instead of recreating a torch.eye() on every forward pass.
+        cand_proj = self.cand_proj(candidate_emb)  # [B, hidden_size]
 
         attention_scores = self._compute_attention(hidden_states, cand_proj)  # [B, T]
 

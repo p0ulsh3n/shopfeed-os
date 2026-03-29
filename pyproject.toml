@@ -14,7 +14,8 @@ dependencies = [
 
     # --- Async DB ---
     "asyncpg>=0.30",
-    "aioredis>=2.0",
+    # BUG #18 FIX: aioredis is officially archived (merged into redis-py 4.2+).
+    # redis>=5.2 provides full async support via `redis.asyncio` — no aioredis needed.
     "redis>=5.2",
 
     # --- Kafka ---

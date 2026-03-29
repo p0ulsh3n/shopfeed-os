@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -117,11 +118,19 @@ async def _send_in_app(user_id: str, notif_id: str, title: str, body: str, data:
 # ──────────────────────────────────────────────────────────────
 
 async def schedule_live_reminders(live_id: str, vendor_name: str, scheduled_at: datetime, follower_ids: list[str]):
-    """Schedule 3 reminder notifications for a live stream."""
+    """Schedule 3 reminder notifications for a live stream.
+
+    BUG #S8 FIX: Previously calculated the delay for each reminder and
+    then just logged it (no actual scheduling). The reminders at J-24h,
+    J-1h, and J-15min were never sent.
+
+    Fixed with asyncio.create_task + asyncio.sleep so each reminder fires
+    at the right time without blocking the event loop.
+    """
     reminders = [
         (24 * 3600, f"Demain en live : {vendor_name}", "Ne manque pas le live de demain !"),
         (3600,      f"Dans 1h : {vendor_name} en live", "Prépare-toi, ça commence bientôt !"),
-        (900,       f"C'est dans 15 minutes !", f"{vendor_name} passe en live très bientôt"),
+        (900,       f"C'est dans 15 minutes !",          f"{vendor_name} passe en live très bientôt"),
     ]
 
     for offset_s, title, body in reminders:
@@ -130,7 +139,40 @@ async def schedule_live_reminders(live_id: str, vendor_name: str, scheduled_at: 
         delay = send_at - now.timestamp()
 
         if delay > 0:
-            logger.info("Live reminder scheduled: live=%s, in=%.0fs", live_id, delay)
+            # BUG #S8 FIX: actually schedule with asyncio.create_task
+            asyncio.create_task(
+                _send_live_reminder_after(
+                    delay=delay,
+                    live_id=live_id,
+                    follower_ids=follower_ids,
+                    title=title,
+                    body=body,
+                )
+            )
+            logger.info("Live reminder scheduled: live=%s, in=%.0fs, followers=%d", live_id, delay, len(follower_ids))
+
+
+async def _send_live_reminder_after(
+    delay: float,
+    live_id: str,
+    follower_ids: list[str],
+    title: str,
+    body: str,
+) -> None:
+    """Wait `delay` seconds, then send push + in-app to all followers."""
+    await asyncio.sleep(delay)
+    logger.info("Firing live reminder: live=%s, followers=%d", live_id, len(follower_ids))
+    for user_id in follower_ids:
+        try:
+            await _send_push(user_id, title, body, {"live_id": live_id, "type": "live_reminder"})
+            await _send_in_app(
+                user_id,
+                f"reminder_{live_id}_{int(delay)}",
+                title, body,
+                {"live_id": live_id, "type": "live_reminder"},
+            )
+        except Exception as e:
+            logger.warning("Reminder delivery failed for user=%s: %s", user_id, e)
 
 
 @app.get("/api/v1/notifications/{user_id}")

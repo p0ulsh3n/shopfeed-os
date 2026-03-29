@@ -153,6 +153,16 @@ class BSTModel(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
 
+        # BUG #15 FIX: nn.MultiheadAttention requires embed_dim % n_heads == 0.
+        # Without this check, PyTorch raises an obscure RuntimeError deep in the
+        # attention kernel with no mention of which parameter caused it.
+        if embed_dim % n_heads != 0:
+            valid_heads = [h for h in range(1, embed_dim + 1) if embed_dim % h == 0]
+            raise ValueError(
+                f"BSTModel: embed_dim ({embed_dim}) must be divisible by n_heads ({n_heads}). "
+                f"Valid n_heads values for embed_dim={embed_dim}: {valid_heads}"
+            )
+
         # Embeddings
         self.item_embedding = nn.Embedding(n_items, embed_dim, padding_idx=0)
         self.category_embedding = nn.Embedding(n_categories, embed_dim // 2, padding_idx=0)

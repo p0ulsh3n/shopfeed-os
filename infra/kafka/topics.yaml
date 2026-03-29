@@ -1,71 +1,251 @@
-# ShopFeed OS — Kafka Topic Definitions
-# Section 14 — 8 topics
+---
+# ShopFeed Kafka Topics — tous les topics inter-services
+# Schéma: Avro (schemas dans infra/kafka/schemas/)
+# Key: UUID de l'entité principale
+# ─────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────
-# Topic specifications
-# ──────────────────────────────────────────────────────────
+# ── Commerce Events ───────────────────────────────────────────────────────────
 
 topics:
-  # User behavioral events (feed interactions)
-  - name: shopfeed.user.events
-    partitions: 12
-    replication: 3
-    retention_ms: 604800000   # 7 days
-    key: user_id
-    description: "Feed interactions: view, pause, zoom, skip, share, save"
-
-  # Commerce events (cart, purchase)
   - name: shopfeed.commerce.events
-    partitions: 12
+    description: "Commandes, paiements, retours"
+    partitions: 24
     replication: 3
-    retention_ms: 2592000000  # 30 days
-    key: user_id
-    description: "Commerce funnel: view_product, add_to_cart, buy_now, checkout, order"
-
-  # Vendor lifecycle events
-  - name: shopfeed.vendor.events
-    partitions: 6
-    replication: 3
-    retention_ms: 2592000000  # 30 days
-    key: vendor_id
-    description: "Vendor actions: product_published, live_started, flash_sale"
-
-  # Live commerce events
-  - name: shopfeed.live.events
-    partitions: 12
-    replication: 3
-    retention_ms: 604800000   # 7 days
-    key: live_id
-    description: "Live: join, leave, comment, gift, product_click, buy_now"
-
-  # Order created → triggers GeoSort
-  - name: shopfeed.orders.created
-    partitions: 6
-    replication: 3
-    retention_ms: 2592000000  # 30 days
+    retention_ms: 604800000  # 7 jours
+    schema: commerce_event_v1
     key: order_id
-    description: "New orders → consumed by GeoSort for classification"
+    consumers:
+      - analytics-service
+      - payments-service
+      - notifications-service
+      - seller_hub-service
+    message_schema:
+      fields:
+        - event_type: "order_placed|payment_success|order_cancelled|return_initiated"
+        - order_id: UUID
+        - user_id: UUID
+        - vendor_id: UUID
+        - amount: decimal
+        - items: list[{product_id, qty, price}]
+        - timestamp: ISO8601
 
-  # ML feature updates
-  - name: shopfeed.ml.features
-    partitions: 6
+  - name: shopfeed.product.events
+    description: "Création, modification, suppression de produits"
+    partitions: 12
     replication: 3
-    retention_ms: 86400000    # 1 day
-    key: entity_id
-    description: "Feature store updates for online training (Monolith)"
-
-  # Notification dispatch
-  - name: shopfeed.notifications.send
-    partitions: 6
-    replication: 3
-    retention_ms: 86400000    # 1 day
-    key: user_id
-    description: "Notification dispatch: push, in-app, live reminders"
-
-  # Search index updates
-  - name: shopfeed.search.index
-    partitions: 3
-    replication: 3
-    retention_ms: 604800000   # 7 days
+    retention_ms: 604800000
+    schema: product_event_v1
     key: product_id
-    description: "Product index updates for Elasticsearch sync"
+    consumers:
+      - search-service (Elasticsearch index)
+      - ml-monolith (embedding invalidation)
+      - ml-inference (FAISS index update trigger)
+      - moderation-service
+      - catalog-service
+    message_schema:
+      fields:
+        - event_type: "product_created|product_updated|product_published|product_deleted"
+        - product_id: UUID
+        - vendor_id: UUID
+        - title: string
+        - price: decimal
+        - category_id: int
+        - image_urls: list[string]
+        - timestamp: ISO8601
+
+# ── Feed Events ───────────────────────────────────────────────────────────────
+
+  - name: shopfeed.feed.events
+    description: "Interactions utilisateur avec le feed (principal)"
+    partitions: 32
+    replication: 3
+    retention_ms: 259200000  # 3 jours
+    schema: feed_event_v1
+    key: user_id
+    consumers:
+      - ml-monolith (streaming trainer)
+      - analytics-service
+      - ml-feature-store (feature invalidation)
+    message_schema:
+      fields:
+        - event_type: "view|zoom|save|like|share|add_to_cart|buy_now|skip|dwell|watch_pct|scroll_past"
+        - user_id: UUID
+        - item_id: UUID
+        - item_type: "product|video|carousel|live"
+        - dwell_ms: int
+        - watch_pct: float [0,1]
+        - source: "feed|marketplace|live|search|ads"
+        - position_in_feed: int
+        - session_id: UUID
+        - timestamp: ISO8601
+
+  - name: shopfeed.session.events
+    description: "Événements de session (start, update, end)"
+    partitions: 16
+    replication: 3
+    retention_ms: 86400000  # 1 jour
+    schema: session_event_v1
+    key: session_id
+    consumers:
+      - feed-service (session state)
+      - ml-inference (/v1/session/intent-vector update)
+    message_schema:
+      fields:
+        - event_type: "session_started|session_action|session_ended"
+        - session_id: UUID
+        - user_id: UUID
+        - actions: list[SessionAction]
+        - timestamp: ISO8601
+
+# ── Live Events ───────────────────────────────────────────────────────────────
+
+  - name: shopfeed.live.events
+    description: "Événements live (join, buy, gift, comment)"
+    partitions: 16
+    replication: 3
+    retention_ms: 86400000
+    schema: live_event_v1
+    key: live_id
+    consumers:
+      - live-service (leaderboard)
+      - ml-monolith (live features update)
+      - notifications-service (live_end alerts)
+    message_schema:
+      fields:
+        - event_type: "live_started|live_ended|viewer_joined|viewer_left|buy_now_click|gift_sent|comment"
+        - live_id: UUID
+        - vendor_id: UUID
+        - user_id: UUID
+        - amount: decimal (for buy_now/gift)
+        - product_id: UUID (for buy_now)
+        - timestamp: ISO8601
+
+  - name: shopfeed.live.metrics
+    description: "Métriques live temps-réel (compacted)"
+    partitions: 8
+    replication: 3
+    retention_ms: 3600000  # 1h
+    compacted: true
+    key: live_id
+    consumers:
+      - live-service (live_score computation)
+      - ml-inference (live embedding update)
+    message_schema:
+      fields:
+        - live_id: UUID
+        - concurrent_viewers: int
+        - gmv_per_minute: decimal
+        - buy_now_count_5min: int
+        - explorer_score: float
+        - timestamp: ISO8601
+
+# ── Moderation Events ─────────────────────────────────────────────────────────
+
+  - name: shopfeed.moderation.events
+    description: "Résultats de modération (approve/reject/review)"
+    partitions: 8
+    replication: 3
+    retention_ms: 2592000000  # 30 jours (archived)
+    schema: moderation_event_v1
+    key: content_id
+    consumers:
+      - catalog-service (update product status)
+      - messaging-service (pre-send decisions)
+      - notifications-service (vendor notify)
+    message_schema:
+      fields:
+        - event_type: "content_approved|content_rejected|content_flagged"
+        - content_id: UUID
+        - content_type: "product|video|message|comment|live"
+        - vendor_id: UUID
+        - reason: string
+        - layers_passed: list[string]
+        - timestamp: ISO8601
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+  - name: shopfeed.notifications.fanout
+    description: "Fanout notifications push (FCM/APNs)"
+    partitions: 16
+    replication: 3
+    retention_ms: 3600000  # 1h → TTL court
+    schema: notification_fanout_v1
+    key: user_id
+    consumers:
+      - notifications-service
+    message_schema:
+      fields:
+        - user_id: UUID
+        - notification_type: "order_update|live_start|price_drop|message|system"
+        - title: string
+        - body: string
+        - data: dict
+        - priority: "high|normal"
+        - timestamp: ISO8601
+
+# ── ML Events ────────────────────────────────────────────────────────────────
+
+  - name: shopfeed.ml.model.updated
+    description: "Nouvelle version modèle disponible → trigger reload Triton"
+    partitions: 4
+    replication: 3
+    retention_ms: 86400000
+    schema: model_updated_v1
+    key: model_name
+    consumers:
+      - ml-inference (reload model via registry)
+      - ml-monolith (sync embeddings)
+    message_schema:
+      fields:
+        - model_name: string
+        - version: string
+        - s3_path: string
+        - metrics: dict
+        - timestamp: ISO8601
+
+  - name: shopfeed.ml.feature.invalidated
+    description: "Invalider features ML d'un item ou user (Redis + FAISS)"
+    partitions: 8
+    replication: 3
+    retention_ms: 3600000
+    schema: feature_invalidated_v1
+    key: entity_id
+    consumers:
+      - ml-monolith (Redis cache invalidation)
+      - ml-inference (FAISS index partial update)
+    message_schema:
+      fields:
+        - entity_type: "product|user|vendor"
+        - entity_id: UUID
+        - reason: "price_change|stock_change|new_interaction|profile_update"
+        - timestamp: ISO8601
+
+# ── Analytics ────────────────────────────────────────────────────────────────
+
+  - name: shopfeed.analytics.pixel
+    description: "Pixel tracking analytics (ClickHouse ingestion)"
+    partitions: 32
+    replication: 3
+    retention_ms: 86400000  # 1j → ClickHouse prend le relais
+    schema: pixel_event_v1
+    key: user_id
+    consumers:
+      - analytics-service (ClickHouse insert)
+    message_schema:
+      fields:
+        - pixel_type: "page_view|click|purchase|add_to_cart|video_start|video_end"
+        - user_id: UUID
+        - session_id: UUID
+        - item_id: UUID
+        - source: string
+        - country: string
+        - device: string
+        - timestamp: ISO8601
+
+# ── Topic Naming Convention ───────────────────────────────────────────────────
+#
+# Pattern: shopfeed.{domain}.{action}
+# Domains: commerce, product, feed, session, live, moderation, notifications, ml, analytics
+#
+# Dead Letter Queue: shopfeed.dlq.{original_topic} (auto-created)
+# Compacted topics: compacted=true — pas de retention, key-based compaction

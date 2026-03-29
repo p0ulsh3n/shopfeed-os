@@ -8,6 +8,8 @@ Each loader returns data in a format ready for the training pipeline.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Any
 
 import torch
@@ -82,10 +84,15 @@ class BehaviorSequenceDataset(Dataset):
         interactions: list[dict[str, Any]],
         max_seq_len: int = 200,
         n_tasks: int = 3,
+        # BUG #10 FIX: lowered default from 5 to 1 so cold-start users (<5
+        # interactions) are included in training rather than silently excluded.
+        # The padding mask already handles short histories correctly.
+        min_seq_len: int = 1,
     ):
         self.interactions = interactions
         self.max_seq_len = max_seq_len
         self.n_tasks = n_tasks
+        self.min_seq_len = min_seq_len
         self._preprocess()
 
     def _preprocess(self) -> None:
@@ -98,23 +105,71 @@ class BehaviorSequenceDataset(Dataset):
             user_sequences[uid].append(interaction)
 
         # Sort each user's interactions by timestamp
+        now_ts = time.time()
         self.samples: list[dict[str, Any]] = []
         for uid, seq in user_sequences.items():
             seq.sort(key=lambda x: x.get("timestamp", 0))
 
-            # For each interaction after the first few, create a training sample
-            for i in range(min(5, len(seq)), len(seq)):
+            # BUG #10 FIX: use min_seq_len (default=1) instead of hardcoded 5.
+            # Cold-start users with 1–4 interactions are now included; their
+            # histories will be short but the padding mask handles this correctly.
+            min_start = min(self.min_seq_len, len(seq))
+            for i in range(min_start, len(seq)):
                 history = seq[max(0, i - self.max_seq_len):i]
                 target = seq[i]
+
+                # BUG #7 FIX: previously always torch.zeros(5).
+                # Compute real dense features from data available at dataset build time.
+                # These match what the serving feature store provides at inference:
+                #   [0] log-normalized price       (log1p(price) / 10)
+                #   [1] freshness decay            (exp(-age_hours / 168))
+                #   [2] CV quality score           (0.0–1.0)
+                #   [3] normalized stock ratio     (stock / 100, capped at 1.0)
+                #   [4] vendor account_weight      (0.0–1.0, max=5.0)
+                price = float(target.get("price", target.get("base_price", 0.0)))
+                ts    = float(target.get("timestamp", now_ts))
+                age_hours = max((now_ts - ts) / 3600.0, 0.0)
+                freshness = math.exp(-age_hours / 168.0)  # half-life = 1 week
+                cv_score  = float(target.get("cv_score", 0.5))
+                stock     = float(target.get("stock", target.get("base_stock", 10)))
+                weight    = float(target.get("account_weight", target.get("seller_weight", 1.0)))
 
                 self.samples.append({
                     "behavior_ids": [s.get("item_id", s.get("itemid", 0)) for s in history],
                     "candidate_id": target.get("item_id", target.get("itemid", 0)),
                     "candidate_cat": target.get("category_id", target.get("item_category", 0)),
                     "label": 1 if target.get("behavior_type", target.get("event", "")) in ("buy", "purchase", "transaction") else 0,
+                    # Store raw values so __getitem__ can build the tensor
+                    "_price": math.log1p(price) / 10.0,
+                    "_freshness": freshness,
+                    "_cv_score": cv_score,
+                    "_stock_ratio": min(stock / 100.0, 1.0),
+                    "_weight": min(weight / 5.0, 1.0),
                 })
 
-        logger.info("Built %d training samples from %d interactions", len(self.samples), len(self.interactions))
+        logger.info(
+            "Built %d training samples from %d interactions "
+            "(min_seq_len=%d, pos_rate=%.2f%%)",
+            len(self.samples), len(self.interactions),
+            self.min_seq_len,
+            100.0 * sum(1 for s in self.samples if s["label"] == 1) / max(len(self.samples), 1),
+        )
+
+    @property
+    def pos_weight(self) -> float:
+        """BUG #9 FIX: compute positive class weight for BCELoss.
+
+        With ~1.2% purchase rate (Alibaba UserBehavior) the model converges
+        to predicting 0 everywhere without pos_weight. This property returns
+        the neg/pos ratio so callers can pass it to loss functions:
+
+            loss = DINLoss(pos_weight=torch.tensor([dataset.pos_weight]))
+        """
+        n_pos = sum(1 for s in self.samples if s["label"] == 1)
+        n_neg = len(self.samples) - n_pos
+        if n_pos == 0:
+            return 1.0  # Degenerate case: no positives, no correction needed
+        return n_neg / n_pos
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -132,7 +187,14 @@ class BehaviorSequenceDataset(Dataset):
             "candidate_id": torch.tensor(sample["candidate_id"], dtype=torch.long),
             "candidate_cat": torch.tensor(sample["candidate_cat"], dtype=torch.long),
             "behavior_mask": torch.tensor(mask, dtype=torch.bool),
-            "dense_features": torch.zeros(5),  # placeholder — filled by feature store
+            # BUG #7 FIX: real dense features instead of torch.zeros(5)
+            "dense_features": torch.tensor([
+                sample["_price"],
+                sample["_freshness"],
+                sample["_cv_score"],
+                sample["_stock_ratio"],
+                sample["_weight"],
+            ], dtype=torch.float32),
             "label": torch.tensor(sample["label"], dtype=torch.float32),
         }
 

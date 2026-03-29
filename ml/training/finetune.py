@@ -245,7 +245,13 @@ class FineTuneTrainer:
         return model.to(self.device)
 
     def train(self, model: nn.Module, train_loader: Any, val_loader: Any) -> nn.Module:
-        """Phase 3: Fine-tune with LoRA."""
+        """Phase 3: Fine-tune with LoRA.
+
+        BUG #3 FIX: val_loader was previously accepted as a parameter but
+        NEVER USED — best model was saved based on training loss, which
+        selects the most overfit checkpoint. Fixed by running a real
+        validation pass after each epoch and using val_loss for early stopping.
+        """
         from .din import DINLoss
 
         optimizer = torch.optim.AdamW(
@@ -300,16 +306,58 @@ class FineTuneTrainer:
                 n_batches += 1
 
             scheduler.step()
-            avg_loss = epoch_loss / max(n_batches, 1)
-            logger.info("Epoch %d/%d — Loss: %.4f — LR: %.2e",
-                        epoch + 1, self.config.epochs, avg_loss, scheduler.get_last_lr()[0])
+            avg_train_loss = epoch_loss / max(n_batches, 1)
 
-            # Save best
-            if avg_loss < best_val_loss:
-                best_val_loss = avg_loss
+            # BUG #3 FIX: run real validation and use val_loss for model selection.
+            val_loss = self._validate_epoch(model, val_loader, criterion)
+
+            logger.info(
+                "Epoch %d/%d — Train: %.4f | Val: %.4f | LR: %.2e",
+                epoch + 1, self.config.epochs,
+                avg_train_loss, val_loss,
+                scheduler.get_last_lr()[0],
+            )
+
+            # Save best model based on VALIDATION loss (not training loss)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 self._save_lora_weights(model, output_dir / "best_lora.pt")
+                logger.info("  ★ New best val_loss=%.4f — checkpoint saved", val_loss)
 
         return model
+
+    @torch.no_grad()
+    def _validate_epoch(
+        self,
+        model: nn.Module,
+        val_loader: Any,
+        criterion: nn.Module,
+    ) -> float:
+        """Run one validation pass and return mean loss."""
+        model.eval()
+        total_loss = 0.0
+        n_batches = 0
+
+        for batch in val_loader:
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            preds = model(
+                behavior_ids=batch["behavior_ids"],
+                candidate_id=batch["candidate_id"],
+                candidate_cat=batch["candidate_cat"],
+                dense_features=batch["dense_features"],
+                behavior_mask=batch.get("behavior_mask"),
+            )
+            if isinstance(preds, tuple):
+                preds = preds[0]
+
+            labels = [batch["label"].unsqueeze(1)] * len(preds)
+            loss = criterion(preds, labels)
+            total_loss += loss.item()
+            n_batches += 1
+
+        model.train()
+        return total_loss / max(n_batches, 1)
 
     def _save_lora_weights(self, model: nn.Module, path: Path) -> None:
         """Save only the LoRA adapter weights (tiny file)."""
