@@ -71,7 +71,7 @@ logs/
 
 # Machine Learning / Data (ShopFeed OS specific)
 # Do not commit weights, datasets, or exports
-data/
+/data/
 *.pt
 *.pth
 *.onnx
@@ -80,9 +80,9 @@ data/
 *.h5
 *.pb
 *.tflite
-models/
-exports/
-checkpoints/
+/models/
+/exports/
+/checkpoints/
 wandb/
 
 # Local cache / SQLite / Redis
