@@ -124,19 +124,8 @@ class RankingPipeline:
             )
             return raw_scores
         except Exception as e:
-            logger.warning(f"MTL scoring failed: {e}, using fallback uniform scores")
-            return {
-                iid: {
-                    "p_buy_now": 0.01,
-                    "p_purchase": 0.01,
-                    "p_add_to_cart": 0.02,
-                    "p_save": 0.03,
-                    "p_share": 0.01,
-                    "e_watch_time": 0.5,
-                    "p_negative": 0.01,
-                }
-                for iid in candidates
-            }
+            logger.warning(f"MTL scoring failed: {e}, using popularity-based fallback")
+            return self._popularity_fallback(candidates)
 
     def _compute_commerce_score(self, mtl_scores: dict) -> float:
         """Σ (task_weight × prediction)"""
@@ -144,6 +133,51 @@ class RankingPipeline:
             TASK_WEIGHTS[task] * mtl_scores.get(task, 0.0)
             for task in TASK_WEIGHTS
         )
+
+    def _popularity_fallback(self, candidates: list[str]) -> dict[str, dict]:
+        """Popularity-based MTL fallback — uses Redis impression counts.
+
+        Instead of giving identical scores to every item (which makes ranking
+        random), we use each item's impression count as a proxy for quality.
+        More-seen items get slightly higher base scores, creating a meaningful
+        ranking even when the MTL model is unavailable.
+        """
+        fallback = {}
+        impressions = {}
+
+        # Try to fetch real popularity data from Redis
+        if self.redis:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                pipe = self.redis.pipeline()
+                for iid in candidates:
+                    pipe.get(f"item:{iid}:impressions")
+                values = loop.run_until_complete(pipe.execute()) if pipe else []
+                for iid, val in zip(candidates, values):
+                    impressions[iid] = int(val) if val else 0
+            except Exception:
+                pass
+
+        max_imp = max(impressions.values()) if impressions else 1
+
+        for i, iid in enumerate(candidates):
+            # Normalize impression count to 0-1 range, with position decay
+            pop_score = impressions.get(iid, 0) / max(max_imp, 1)
+            position_decay = 1.0 - (i / max(len(candidates), 1)) * 0.1
+            base = 0.01 + pop_score * 0.04  # Range: 0.01 → 0.05
+
+            fallback[iid] = {
+                "p_buy_now": base * 0.5 * position_decay,
+                "p_purchase": base * 0.8 * position_decay,
+                "p_add_to_cart": base * 1.5 * position_decay,
+                "p_save": base * 2.0 * position_decay,
+                "p_share": base * 0.5 * position_decay,
+                "e_watch_time": 0.3 + pop_score * 0.4,
+                "p_negative": 0.01,
+            }
+
+        return fallback
 
     # ─── Étape 4 : Diversity re-ranking DPP (<10ms) ─────────────────────────
 
@@ -205,19 +239,93 @@ class RankingPipeline:
         result: list,
         session_id: str,
     ) -> list:
+        """Inject complementary items when buy_now trigger is active.
+
+        When a user clicks 'buy now', Redis stores the purchased item's
+        category + vendor. We fetch 2 complementary items from the same
+        category (different vendor to avoid monopole) and inject them
+        at position 3 in the feed — the optimal cross-sell slot.
         """
-        Si buy_now trigger actif en Redis → injecter cross-sell
-        depuis la même catégorie à position 3.
-        """
-        if not self.redis:
+        if not self.redis or len(result) < 4:
             return result
         try:
-            trigger = await self.redis.get(f"session:{session_id}:cross_sell_trigger")
-            if trigger:
-                logger.debug(f"Cross-sell trigger active for session {session_id}")
-                # TODO: fetch cross-sell items from catalog, inject at pos 3
-        except Exception:
-            pass
+            trigger_data = await self.redis.get(
+                f"session:{session_id}:cross_sell_trigger"
+            )
+            if not trigger_data:
+                return result
+
+            import json
+            trigger = json.loads(trigger_data)
+            category_id = trigger.get("category_id")
+            exclude_vendor = trigger.get("vendor_id", "")
+
+            if not category_id:
+                return result
+
+            # Fetch top items in same category from Redis sorted set
+            cross_sell_ids = await self.redis.zrevrange(
+                f"category:{category_id}:top_items", 0, 9
+            )
+            if not cross_sell_ids:
+                return result
+
+            # Filter out items already in result + same vendor
+            existing_ids = {r[0] for r in result}
+            injected = 0
+            inject_pos = 3  # After position 3 in feed
+
+            for cs_id in cross_sell_ids:
+                if isinstance(cs_id, bytes):
+                    cs_id = cs_id.decode("utf-8")
+                if cs_id in existing_ids:
+                    continue
+
+                # Get item metadata from Redis
+                meta_raw = await self.redis.hgetall(f"item:{cs_id}:meta")
+                meta = {k.decode() if isinstance(k, bytes) else k:
+                        v.decode() if isinstance(v, bytes) else v
+                        for k, v in meta_raw.items()} if meta_raw else {}
+
+                # Skip same vendor (diversity)
+                if meta.get("vendor_id") == exclude_vendor:
+                    continue
+
+                # Build cross-sell entry with boosted score
+                cs_flags = DiversityFlags(
+                    is_new_vendor=False,
+                    is_regional=False,
+                    is_cold_start=False,
+                )
+                # Score slightly below the item at insert position
+                insert_score = result[min(inject_pos, len(result) - 1)][1] * 0.95
+
+                cs_entry = (cs_id, insert_score, {
+                    "p_buy_now": 0.05,
+                    "p_purchase": 0.08,
+                    "p_add_to_cart": 0.12,
+                    "p_save": 0.06,
+                    "p_share": 0.02,
+                    "e_watch_time": 0.6,
+                    "p_negative": 0.005,
+                    "vendor_id": meta.get("vendor_id", ""),
+                    "category_id": category_id,
+                    "is_cross_sell": True,
+                }, cs_flags)
+
+                result.insert(inject_pos + injected, cs_entry)
+                injected += 1
+                if injected >= 2:
+                    break
+
+            if injected > 0:
+                logger.info(
+                    "Cross-sell: injected %d items at pos %d for session %s (cat=%s)",
+                    injected, inject_pos, session_id, category_id,
+                )
+
+        except Exception as e:
+            logger.warning(f"Cross-sell injection failed: {e}")
         return result
 
     # ─── Pipeline principal ──────────────────────────────────────────────────

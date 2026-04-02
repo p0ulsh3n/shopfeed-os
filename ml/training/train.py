@@ -46,6 +46,14 @@ from ml.training.din import DINModel, DINLoss
 from ml.training.dien import DIENModel, DIENLoss
 from ml.training.bst import BSTModel, BSTLoss
 
+# MLOps integrations (archi-2026 §9.6)
+try:
+    from ml.tracking import log_training_run, register_model, HAS_MLFLOW
+except ImportError:
+    HAS_MLFLOW = False
+    def log_training_run(*a, **kw): return None
+    def register_model(*a, **kw): return None
+
 logger = logging.getLogger(__name__)
 
 # Feature dimensions (set dynamically by feature store)
@@ -457,6 +465,26 @@ class Trainer:
         self._save_checkpoint(self.config.epochs - 1, is_best=False)
         logger.info("Training complete. Best val_loss=%.4f", self.best_metric)
 
+        # ── MLflow tracking (archi-2026 §9.6) ────────────────
+        try:
+            run_id = log_training_run(
+                model_name=self.config.model_name,
+                config=self.config.__dict__,
+                metrics=final_metrics,
+                model_path=str(self.output_dir / "model_best.pt"),
+                tags={"trainer": "batch", "device": str(self.device)},
+            )
+            if run_id:
+                logger.info("MLflow run logged: %s", run_id)
+        except Exception as e:
+            logger.warning("MLflow logging skipped: %s", e)
+
+        # Save metrics.json for Kubeflow validation gate
+        metrics_path = self.output_dir / "metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(final_metrics, f, indent=2, default=str)
+        logger.info("Metrics saved: %s", metrics_path)
+
         return final_metrics
 
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
@@ -809,6 +837,22 @@ def main():
         logger.info("Building FAISS index...")
         # Would load item features from dataset
         logger.info("FAISS index building requires item features — use build_faiss_index()")
+
+    # Register model in MLflow Model Registry (archi-2026 §9.6)
+    try:
+        from ml.tracking import log_training_run, register_model
+        run_id = log_training_run(
+            model_name=config.model_name,
+            config=config.__dict__,
+            metrics=metrics,
+            model_path=str(Path(config.output_dir) / config.model_name / "model_best.pt"),
+        )
+        if run_id:
+            version = register_model(f"shopfeed_{config.model_name}", run_id)
+            if version:
+                logger.info("Model registered: shopfeed_%s v%s", config.model_name, version)
+    except Exception as e:
+        logger.warning("MLflow registration skipped: %s", e)
 
     logger.info("Final metrics: %s", json.dumps(metrics, indent=2, default=str))
 

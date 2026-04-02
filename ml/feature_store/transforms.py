@@ -210,4 +210,23 @@ def user_to_features(
         1.0 if device == "android" else 0.0,
     ], dtype=torch.float32))
 
+    # t.md §5: Desire Graph 6D — 10D psychographic vector
+    # Appended AFTER all existing features (does not shift any indices)
+    try:
+        from .desire_graph import DesireGraph
+        desire_graph = DesireGraph()
+        session_state = user.get("_session_state", {})
+        desire_vec = desire_graph.compute_desire_vector(
+            user_profile=user,
+            session_state=session_state,
+            hour=int(user.get("_current_hour", 12)),
+            minute=int(user.get("_current_minute", 0)),
+            day_of_week=int(user.get("_current_dow", 0)),
+            session_duration_s=float(user.get("_session_duration_s", 0)),
+        )
+        features.append(desire_vec)
+    except Exception:
+        # Graceful fallback: zero desire vector if anything fails
+        features.append(torch.zeros(10))
+
     return torch.cat(features)

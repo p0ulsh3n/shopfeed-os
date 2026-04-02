@@ -1,7 +1,8 @@
 """
 Pydantic v2 schemas for ML Inference API.
-Couvre les 6 endpoints : /v1/feed/rank, /v1/embed/user, /v1/embed/product,
-/v1/session/intent-vector, /v1/moderation/clip-check, /v1/health
+Couvre les 9 endpoints : /v1/feed/rank, /v1/embed/user, /v1/embed/product,
+/v1/session/intent-vector, /v1/moderation/clip-check, /v1/health,
+/v1/llm/search, /v1/llm/vendor-insights, /v1/llm/generate-ad-copy
 """
 
 from __future__ import annotations
@@ -159,10 +160,70 @@ class ClipCheckResponse(BaseModel):
     similarity_score: float
     closest_category_id: int
     confidence: float
+    explanation: str = Field("", description="Llama 4 Scout explanation of WHY flagged (empty if match=True)")
+    suggested_fixes: list[str] = Field(default_factory=list, description="Actionable fixes for the vendor")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoint 6 — GET /v1/health
+# Endpoint 6 — POST /v1/llm/search  (Conversational Search)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConversationalSearchRequest(BaseModel):
+    query: str = Field(..., description="Natural language search query")
+    categories: list[str] = Field(default_factory=list, description="Available categories")
+
+
+class ConversationalSearchResponse(BaseModel):
+    category: str = ""
+    attributes: dict = Field(default_factory=dict)
+    price_range: dict = Field(default_factory=dict)
+    sort_by: str = "relevance"
+    keywords: list[str] = Field(default_factory=list)
+    intent: str = "browse"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 7 — POST /v1/llm/vendor-insights
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VendorInsightsRequest(BaseModel):
+    vendor_name: str
+    product_count: int = 0
+    avg_cv_score: float = 0.5
+    monthly_views: int = 0
+    conversion_rate: float = 0.0
+    campaign_metrics: dict = Field(default_factory=dict)
+
+
+class VendorInsightsResponse(BaseModel):
+    insights: str = Field(..., description="Natural language strategy recommendations")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 8 — POST /v1/llm/generate-ad-copy
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdCopyRequest(BaseModel):
+    product_title: str
+    product_description: str = ""
+    target_audience: str = "general"
+    vendor_name: str = ""
+    num_variants: int = Field(5, ge=1, le=10)
+
+
+class AdCopyVariant(BaseModel):
+    headline: str = ""
+    body: str = ""
+    cta: str = ""
+    tone: str = ""
+
+
+class AdCopyResponse(BaseModel):
+    variants: list[AdCopyVariant] = Field(default_factory=list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 9 — GET /v1/health
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModelVersions(BaseModel):

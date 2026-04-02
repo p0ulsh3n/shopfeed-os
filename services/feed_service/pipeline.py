@@ -67,6 +67,13 @@ class FeedCandidate:
     freshness_mult: float = 1.0         # ×1.0 to ×2.0
     geo_mult: float = 1.0              # ×1.0 to ×1.2
     content_type_mult: float = 1.0     # Section 01
+    temporal_mult: float = 1.0         # t.md §2: circadian vulnerability [1.0, 1.4]
+
+    # t.md §3: Zeigarnik collection boost
+    zeigarnik_boost: float = 0.0       # [0, 0.3] boost for incomplete collections
+
+    # t.md §4: Variable-ratio reward tier
+    reward_tier: str = "baseline"       # baseline | wow | destiny
 
     # Metadata
     base_price: float = 0.0
@@ -80,9 +87,11 @@ class FeedCandidate:
         Score_Final = Score_Contenu × Account_Weight × M_freshness
                     × M_geo × M_content_type
         """
-        # Base: commerce score from MTL + online delta + session boost
         base = self.commerce_score + self.online_delta + self.session_boost
-        return base * self.account_weight * self.freshness_mult * self.geo_mult * self.content_type_mult
+        # t.md: temporal_mult + zeigarnik_boost are additive on top of existing flow
+        return (base * self.account_weight * self.freshness_mult
+                * self.geo_mult * self.content_type_mult * self.temporal_mult
+                + self.zeigarnik_boost)
 
 
 class RecommendationPipeline:
@@ -394,6 +403,26 @@ class SessionState:
         elif action_type == "not_interested" and category:
             if category not in session["negative_categories"]:
                 session["negative_categories"].append(category)
+
+        # t.md §1: Micro-pause behavioral signals (subconscious desire detection)
+        elif action_type == "micro_pause" and category:
+            cats = session["active_categories"]
+            cats[category] = cats.get(category, 0) + 0.15  # lighter than explicit pause
+
+        elif action_type == "scroll_slow" and category:
+            cats = session["active_categories"]
+            cats[category] = cats.get(category, 0) + 0.1
+
+        elif action_type == "gaze_linger" and category:
+            cats = session["active_categories"]
+            cats[category] = cats.get(category, 0) + 0.2
+            if session["intent_level"] == "low":
+                session["intent_level"] = "medium"
+
+        elif action_type == "scroll_reverse" and category:
+            # User scrolled back to look at this item again — strong signal
+            cats = session["active_categories"]
+            cats[category] = cats.get(category, 0) + 0.25
 
         # Record action
         actions = session["last_actions"]

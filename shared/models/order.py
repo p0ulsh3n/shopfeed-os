@@ -32,7 +32,7 @@ class ShippingAddress(BaseModel):
     street: str = ""
     commune: str = ""
     city: str = ""
-    country: str = "CI"
+    country: str = ""                       # ISO 3166 — set by app
     lat: float | None = None
     lon: float | None = None
     raw_text: str | None = None     # For NLP geocoding of informal addresses

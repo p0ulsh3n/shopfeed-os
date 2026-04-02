@@ -1,22 +1,24 @@
-"""GeoSort Service — Geographic Order Classification — Section 43."""
+"""GeoSort Service — Global Order Geo-Classification."""
 
 from .classifier import (
-    GEO_ZONES,
-    GeoZoneEntry,
+    classify_order,
     haversine_km,
-    nlp_geocode_address,
-    suggest_shipping,
+    resolve_location,
+    GeoLocation,
+    OrderClassification,
+    SAME_ZONE_RADIUS_KM,
 )
-from .routes import app
 from .schemas import ClassifyRequest, ClassifyResponse
+from .routes import app
 
 __all__ = [
-    "app",
+    "classify_order",
+    "haversine_km",
+    "resolve_location",
+    "GeoLocation",
+    "OrderClassification",
+    "SAME_ZONE_RADIUS_KM",
     "ClassifyRequest",
     "ClassifyResponse",
-    "GeoZoneEntry",
-    "GEO_ZONES",
-    "haversine_km",
-    "nlp_geocode_address",
-    "suggest_shipping",
+    "app",
 ]

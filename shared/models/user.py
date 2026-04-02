@@ -37,7 +37,7 @@ class User(BaseModel):
     gender: str | None = None               # m / f / other / prefer_not
     city: str | None = None
     commune: str | None = None
-    country: str = "CI"                     # ISO 3166
+    country: str = ""                       # ISO 3166 — set by app
     lat: float | None = None
     lon: float | None = None
     persona: Persona = Persona.UNKNOWN

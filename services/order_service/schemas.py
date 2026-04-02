@@ -20,7 +20,7 @@ class CheckoutRequest(BaseModel):
     shipping_street: str = ""
     shipping_commune: str = ""
     shipping_city: str = ""
-    shipping_country: str = "CI"
+    shipping_country: str = ""
     shipping_lat: float | None = None
     shipping_lon: float | None = None
     raw_address: str | None = None      # For NLP geocoding

@@ -27,6 +27,9 @@ from ml.inference.schemas import (
     EmbedProductRequest, EmbedProductResponse,
     IntentVectorRequest, IntentVectorResponse,
     ClipCheckRequest, ClipCheckResponse,
+    ConversationalSearchRequest, ConversationalSearchResponse,
+    VendorInsightsRequest, VendorInsightsResponse,
+    AdCopyRequest, AdCopyResponse, AdCopyVariant,
     HealthResponse,
 )
 from ml.inference.health import get_health
@@ -158,8 +161,12 @@ async def embed_user(
         )
         embedding_list = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
     except Exception as e:
-        logger.warning(f"User embed failed: {e}, returning random embedding")
-        embedding_list = np.random.randn(256).tolist()
+        logger.warning(f"User embed failed: {e}, returning zero embedding (degraded mode)")
+        # CRITICAL: DO NOT use np.random.randn() here — a random embedding sends
+        # the user to a random region of the vector space, producing completely
+        # incoherent recommendations. A zero vector is neutral and will default
+        # to popular/cold-start items via the ranking pipeline.
+        embedding_list = np.zeros(256).tolist()
 
     # Mise en cache Redis
     try:
@@ -221,24 +228,35 @@ async def embed_product(
         logger.warning(f"CLIP encode failed for {request.product_id}: {e}")
         clip_embedding = np.zeros(512).tolist()
 
-    # 2. CV Quality Score (SightEngine)
+    # 2. CV Quality Score (Llama 4 Scout multimodal)
     try:
         from ml.cv.quality_scorer import score_product_photo
-        result = await score_product_photo(request.image_url)
+        result = await score_product_photo(
+            request.image_url, request.title, str(request.category_id)
+        )
         cv_score = result.get("score", 0.5)
     except Exception as e:
         logger.warning(f"Quality score failed: {e}")
 
-    # 3. BLIP-2 auto description
+    # 3. Llama 4 Scout product enrichment (replaces BLIP-2 + basic tags)
+    #    → SEO description, auto-tags, attributes, search keywords
     try:
-        from ml.cv.blip2_describer import describe_product
-        auto_description = await describe_product(request.image_url, request.title)
+        from ml.llm.llm_enrichment import enrich_product
+        enrichment = await enrich_product(
+            product_title=request.title,
+            product_image_url=request.image_url,
+            category_name=str(request.category_id),
+            vendor_description=request.description,
+        )
+        auto_description = enrichment.get(
+            "seo_description",
+            request.description[:200] if request.description else "",
+        )
+        auto_tags = enrichment.get("auto_tags", [])[:15]
     except Exception as e:
-        logger.warning(f"BLIP-2 failed: {e}")
+        logger.warning(f"LLM enrichment failed, using basic fallback: {e}")
         auto_description = request.description[:200] if request.description else ""
-
-    # 4. Auto-tags depuis titre + description
-    auto_tags = [w.lower() for w in request.title.split() if len(w) > 3][:10]
+        auto_tags = [w.lower() for w in request.title.split() if len(w) > 3][:10]
 
     # 5. Category verification
     try:
@@ -368,6 +386,9 @@ async def moderation_clip_check(
     """
     CLIP zero-shot: vérifie que l'image correspond à la catégorie déclarée.
     Utilisé par moderation_service step 3 (category verification).
+
+    Si le produit est flaggé (match=False), utilise Llama 4 Scout pour
+    expliquer POURQUOI → transparence pour les vendeurs.
     """
     loop = asyncio.get_event_loop()
     try:
@@ -376,11 +397,34 @@ async def moderation_clip_check(
             None,
             lambda: verify_category(request.image_url, request.declared_category_id),
         )
+
+        match = result.get("match", False)
+        similarity = result.get("score", 0.0)
+        explanation = ""
+        suggested_fixes: list[str] = []
+
+        # If flagged → explain WHY via Llama 4 Scout
+        if not match:
+            try:
+                from ml.llm.llm_enrichment import explain_moderation
+                explanation_data = await explain_moderation(
+                    product_title=f"Product in category {request.declared_category_id}",
+                    image_url=request.image_url,
+                    moderation_scores={"category_match": similarity},
+                    flagged_reasons=["category_mismatch"],
+                )
+                explanation = explanation_data.get("explanation", "")
+                suggested_fixes = explanation_data.get("suggested_fixes", [])
+            except Exception as ex:
+                logger.debug(f"Moderation explanation unavailable: {ex}")
+
         return ClipCheckResponse(
-            match=result.get("match", False),
-            similarity_score=result.get("score", 0.0),
+            match=match,
+            similarity_score=similarity,
             closest_category_id=result.get("closest_category", request.declared_category_id),
             confidence=result.get("confidence", 0.0),
+            explanation=explanation,
+            suggested_fixes=suggested_fixes,
         )
     except Exception as e:
         logger.error(f"CLIP check failed: {e}")
@@ -393,7 +437,120 @@ async def moderation_clip_check(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoint 6 — GET /v1/health
+# Endpoint 6 — POST /v1/llm/search  (Conversational Search → Scout)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/llm/search",
+    response_model=ConversationalSearchResponse,
+    summary="Convert natural language query to structured product filters",
+    tags=["LLM"],
+)
+async def llm_search(
+    request: ConversationalSearchRequest,
+) -> ConversationalSearchResponse:
+    """
+    Recherche conversationnelle via Llama 4 Scout.
+
+    Input:  "robe d'été pour mariage, soie, moins de 200€"
+    Output: {category: "robes", attributes: {season: "été", material: "soie"}, price_range: {max: 200}}
+    """
+    try:
+        from ml.llm.llm_enrichment import conversational_search
+        result = await conversational_search(
+            user_query=request.query,
+            available_categories=request.categories or None,
+        )
+        return ConversationalSearchResponse(**{
+            "category": result.get("category", ""),
+            "attributes": result.get("attributes", {}),
+            "price_range": result.get("price_range", {}),
+            "sort_by": result.get("sort_by", "relevance"),
+            "keywords": result.get("keywords", []),
+            "intent": result.get("intent", "browse"),
+        })
+    except Exception as e:
+        logger.error(f"Conversational search failed: {e}")
+        return ConversationalSearchResponse(
+            keywords=request.query.split(),
+            intent="browse",
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 7 — POST /v1/llm/vendor-insights  (Scout reasoning)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/llm/vendor-insights",
+    response_model=VendorInsightsResponse,
+    summary="Generate strategy insights for vendor dashboard",
+    tags=["LLM"],
+)
+async def llm_vendor_insights(
+    request: VendorInsightsRequest,
+) -> VendorInsightsResponse:
+    """
+    Génère des recommandations stratégiques pour le dashboard vendeur.
+
+    Utilise Llama 4 Scout (17B MoE reasoning).
+    Analyse les métriques de campagne et suggère des quick-wins pour
+    DOUBLER le trafic boutique.
+    """
+    try:
+        from ml.llm.llm_enrichment import generate_vendor_insights
+        insights = await generate_vendor_insights(
+            vendor_name=request.vendor_name,
+            campaign_metrics=request.campaign_metrics,
+            product_count=request.product_count,
+            avg_cv_score=request.avg_cv_score,
+            monthly_views=request.monthly_views,
+            conversion_rate=request.conversion_rate,
+        )
+        return VendorInsightsResponse(insights=insights or "Insights unavailable")
+    except Exception as e:
+        logger.error(f"Vendor insights generation failed: {e}")
+        return VendorInsightsResponse(insights="Insights temporarily unavailable")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 8 — POST /v1/llm/generate-ad-copy  (Scout text gen)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/llm/generate-ad-copy",
+    response_model=AdCopyResponse,
+    summary="Generate ad copy variants for EPSILON campaigns",
+    tags=["LLM"],
+)
+async def llm_generate_ad_copy(
+    request: AdCopyRequest,
+) -> AdCopyResponse:
+    """
+    Génère des variantes de copy publicitaire via Llama 4 Scout.
+
+    Retourne N variantes avec différents tons (luxury, urgent, friendly, etc.)
+    pour permettre au vendeur de choisir ou A/B tester.
+    """
+    try:
+        from ml.llm.llm_enrichment import generate_ad_copy
+        variants = await generate_ad_copy(
+            product_title=request.product_title,
+            product_description=request.product_description,
+            target_audience=request.target_audience,
+            vendor_name=request.vendor_name,
+            num_variants=request.num_variants,
+        )
+        return AdCopyResponse(
+            variants=[AdCopyVariant(**v) for v in variants if isinstance(v, dict)]
+        )
+    except Exception as e:
+        logger.error(f"Ad copy generation failed: {e}")
+        return AdCopyResponse(variants=[])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 9 — GET /v1/health
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get(

@@ -182,3 +182,162 @@ async def get_notifications(user_id: str, unread_only: bool = False):
     if unread_only:
         notifs = [n for n in notifs if not n.get("read")]
     return {"notifications": notifs[-50:], "total": len(notifs)}
+
+
+# ──────────────────────────────────────────────────────────────
+# t.md §6: Pavlovian Conditioned Notifications
+# ──────────────────────────────────────────────────────────────
+
+# Pre-built narrative teaser templates
+_NARRATIVE_TEASERS = [
+    "Ton histoire est en pause… 📖",
+    "Tu étais sur le point de découvrir quelque chose…",
+    "Le prochain chapitre t'attend 🔥",
+    "Ta capsule est presque complète…",
+    "Quelque chose de spécial vient d'arriver pour toi",
+]
+
+# Social proof templates
+_SOCIAL_PROOF_TEMPLATES = [
+    "{count} personnes près de toi complètent cette capsule en ce moment",
+    "{count} acheteurs dans ta zone viennent de craquer pour ça",
+    "Tes voisins n'arrêtent pas de commander ce soir 🛒",
+]
+
+
+@app.post("/api/v1/notifications/schedule-smart")
+async def schedule_smart_notification(req: NotificationRequest):
+    """t.md §6 — Schedule a notification at the optimal circadian time.
+
+    Uses temporal vulnerability scoring to pick the moment when
+    the user's rational filter is lowest (typically late evening).
+    The notification arrives when the brain is most receptive.
+    """
+    import uuid
+    from datetime import timedelta
+
+    notif_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    # Determine optimal send time based on notification type
+    if req.notification_type in ("narrative_teaser", "desire_trigger"):
+        # Narrative teasers work best late evening (21h-23h) or pre-wake (7h-8h)
+        current_hour = now.hour
+        if current_hour < 21:
+            # Schedule for tonight
+            delay_hours = 21 - current_hour + (30 / 60)  # 21:30
+        else:
+            # Schedule for tomorrow morning
+            delay_hours = (7 - current_hour + 24) % 24 + (15 / 60)  # 7:15
+
+        delay_s = delay_hours * 3600
+
+    elif req.notification_type == "collection_reminder":
+        # Collection reminders: send after 4-8 hours of inactivity
+        delay_s = 4 * 3600 + (hash(req.user_id) % (4 * 3600))  # 4-8h, user-seeded
+
+    elif req.notification_type == "social_proof_local":
+        # Social proof: send during high-traffic windows (18h-22h)
+        current_hour = now.hour
+        if 18 <= current_hour <= 22:
+            delay_s = 0  # Send immediately during peak
+        else:
+            delay_hours = (18 - current_hour + 24) % 24
+            delay_s = delay_hours * 3600
+    else:
+        delay_s = 0  # Unknown type: send now
+
+    if delay_s > 0:
+        asyncio.create_task(
+            _send_delayed_notification(
+                delay=delay_s,
+                user_id=req.user_id,
+                notif_id=notif_id,
+                title=req.title,
+                body=req.body,
+                data={**req.data, "type": req.notification_type},
+            )
+        )
+        status = "scheduled"
+    else:
+        await _send_push(req.user_id, req.title, req.body, req.data)
+        await _send_in_app(req.user_id, notif_id, req.title, req.body, req.data)
+        status = "sent"
+
+    _notification_history[req.user_id].append({
+        "id": notif_id,
+        "type": req.notification_type,
+        "title": req.title,
+        "body": req.body,
+        "read": False,
+        "created_at": now.isoformat(),
+        "scheduled": status == "scheduled",
+    })
+
+    return {
+        "notification_id": notif_id,
+        "status": status,
+        "scheduled_delay_s": delay_s if delay_s > 0 else None,
+    }
+
+
+@app.post("/api/v1/notifications/narrative-teaser/{user_id}")
+async def send_narrative_teaser(user_id: str, collection_progress: float = 0.0):
+    """t.md §6 — Send a narrative-continuation teaser.
+
+    "Ton histoire est en pause" — triggers Zeigarnik tension + FOMO.
+    Automatically picks the best teaser template and schedules at
+    the optimal circadian time.
+    """
+    # Pick teaser template based on collection progress
+    if collection_progress > 0.3:
+        title = "Ta capsule est presque complète…"
+        body = f"Tu as {int(collection_progress * 100)}% — il manque si peu pour finir ton histoire 🔥"
+    else:
+        idx = hash(user_id) % len(_NARRATIVE_TEASERS)
+        title = _NARRATIVE_TEASERS[idx]
+        body = "Reviens continuer là où tu t'es arrêté"
+
+    req = NotificationRequest(
+        user_id=user_id,
+        notification_type="narrative_teaser",
+        title=title,
+        body=body,
+        data={"collection_progress": collection_progress},
+    )
+    return await schedule_smart_notification(req)
+
+
+@app.post("/api/v1/notifications/social-proof/{user_id}")
+async def send_social_proof(user_id: str, nearby_count: int = 12):
+    """t.md §6 — "X personnes près de toi complètent cette capsule".
+
+    Local social proof triggers herd instinct + FOMO.
+    """
+    idx = hash(user_id) % len(_SOCIAL_PROOF_TEMPLATES)
+    template = _SOCIAL_PROOF_TEMPLATES[idx]
+    body = template.format(count=nearby_count)
+
+    req = NotificationRequest(
+        user_id=user_id,
+        notification_type="social_proof_local",
+        title="📍 Autour de toi",
+        body=body,
+        data={"nearby_buyers": nearby_count},
+    )
+    return await schedule_smart_notification(req)
+
+
+async def _send_delayed_notification(
+    delay: float,
+    user_id: str,
+    notif_id: str,
+    title: str,
+    body: str,
+    data: dict,
+) -> None:
+    """Wait `delay` seconds, then send push + in-app."""
+    await asyncio.sleep(delay)
+    logger.info("Firing scheduled notification: user=%s, type=%s", user_id, data.get("type"))
+    await _send_push(user_id, title, body, data)
+    await _send_in_app(user_id, notif_id, title, body, data)

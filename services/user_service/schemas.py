@@ -9,7 +9,7 @@ class CreateUserRequest(BaseModel):
     email: str
     full_name: str = ""
     phone: str | None = None
-    country: str = "CI"
+    country: str = ""
     city: str | None = None
 
 
@@ -19,7 +19,7 @@ class CreateVendorRequest(BaseModel):
     description: str = ""
     city: str = ""
     commune: str = ""
-    country: str = "CI"
+    country: str = ""
 
 
 class UpdateProfileRequest(BaseModel):

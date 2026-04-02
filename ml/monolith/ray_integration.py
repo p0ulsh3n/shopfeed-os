@@ -51,9 +51,9 @@ def create_ray_trainer(config: MonolithConfig | None = None) -> Any:
 
         rank = ray_train.get_context().get_world_rank()
 
-        # Each worker consumes a distinct Kafka partition shard via group_id suffix
+        # Each worker consumes a distinct Redpanda partition shard via group_id suffix
         worker_config = MonolithConfig(
-            kafka_bootstrap=cfg.kafka_bootstrap,
+            redpanda_brokers=cfg.redpanda_brokers,
             kafka_topics=cfg.kafka_topics,
             kafka_group_id=f"{cfg.kafka_group_id}-{rank}",
             redis_url=cfg.redis_url,

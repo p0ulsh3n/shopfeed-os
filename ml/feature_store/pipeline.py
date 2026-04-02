@@ -37,14 +37,19 @@ PERSONA_LIST = [
 PERSONA_IDX = {p: i for i, p in enumerate(PERSONA_LIST)}
 
 # Action types → feature vector index
+# t.md §1: Added micro_pause, scroll_slow, gaze_linger, scroll_reverse
+# for subconscious desire detection (50-500ms hesitation signals)
 ACTION_TYPES = [
     "view", "zoom", "save", "like", "share", "comment",
     "add_to_cart", "buy_now", "skip", "dwell", "pause",
     "watch_pct", "live_join", "live_buy",
+    "micro_pause", "scroll_slow", "gaze_linger", "scroll_reverse",
 ]
 ACTION_IDX = {a: i for i, a in enumerate(ACTION_TYPES)}
 
 # Poids des actions (pour attention dans session_to_features)
+# t.md §1: micro-pause signals have moderate positive weights
+# (they indicate subconscious interest, lighter than explicit actions)
 ACTION_WEIGHTS_MAP = {
     "buy_now": 12.0,
     "purchase": 10.0,
@@ -54,6 +59,10 @@ ACTION_WEIGHTS_MAP = {
     "like": 4.0,
     "comment": 3.0,
     "zoom": 2.0,
+    "gaze_linger": 1.8,
+    "scroll_reverse": 1.5,
+    "micro_pause": 1.3,
+    "scroll_slow": 1.1,
     "view": 1.0,
     "skip": -2.0,
     "scroll_past": -1.0,
@@ -248,18 +257,22 @@ def session_to_features(
 ) -> torch.Tensor:
     """
     Transforme une liste d'actions session en feature tensor pour BST.
-    Retourne: [max_seq_len, feature_dim] où feature_dim = 3 + N_cats + 1 + 1 + 1 + 1
+    Retourne: [max_seq_len, feature_dim] où feature_dim = action_dim + N_cats + 7
 
     Features par action:
-      - action_type onehot    [14]
+      - action_type onehot    [18]  (14 original + 4 micro-pause types)
       - category onehot       [N_cat]
       - price_norm            [1]
       - dwell_norm            [1]
       - watch_pct             [1]
       - action_weight         [1]
+      - scroll_velocity_norm  [1]  (t.md §1: slow scroll = high interest)
+      - pause_pattern         [1]  (t.md §1: 50-500ms hesitation flag)
+      - touch_pressure_norm   [1]  (t.md §1: pressure signal proxy)
     """
     action_dim = len(ACTION_TYPES)
-    feature_dim = action_dim + N_CATEGORIES + 4
+    # t.md §1: expanded from +4 to +7 per-action features
+    feature_dim = action_dim + N_CATEGORIES + 7
 
     # Padding à gauche si moins d'actions
     seq_tensor = torch.zeros(max_seq_len, feature_dim)
@@ -296,5 +309,23 @@ def session_to_features(
         weight = ACTION_WEIGHTS_MAP.get(atype, 1.0)
         weight_norm = (weight + 8.0) / 20.0  # normalize [-8,12] → [0,1]
         seq_tensor[pos, action_dim + N_CATEGORIES + 3] = weight_norm
+
+        # ── t.md §1: Micro-pause behavioral signals ──────────────
+
+        # Scroll velocity: normalized inverse speed (slow = high interest)
+        # Raw value expected in px/s from client; 0 = stationary, 5000 = fast flick
+        scroll_vel = float(a.get("scroll_velocity", 2500))
+        scroll_vel_norm = 1.0 - min(scroll_vel / 5000.0, 1.0)  # invert: slow→high
+        seq_tensor[pos, action_dim + N_CATEGORIES + 4] = scroll_vel_norm
+
+        # Pause pattern: binary flag for 50-500ms micro-hesitation
+        pause_ms = float(a.get("pause_ms", 0))
+        pause_flag = 1.0 if 50.0 <= pause_ms <= 500.0 else 0.0
+        seq_tensor[pos, action_dim + N_CATEGORIES + 5] = pause_flag
+
+        # Touch pressure: normalized [0,1] from client force-touch / 3D touch
+        # Defaults to 0.5 (neutral) when sensor data is unavailable
+        pressure = float(a.get("touch_pressure", 0.5))
+        seq_tensor[pos, action_dim + N_CATEGORIES + 6] = min(max(pressure, 0.0), 1.0)
 
     return seq_tensor

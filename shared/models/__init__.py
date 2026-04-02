@@ -11,7 +11,7 @@ from shared.models.user import User, UserProfile, Persona, IntentLevel
 from shared.models.vendor import Vendor, VendorTier
 from shared.models.order import Order, OrderStatus, OrderItem
 from shared.models.live import LiveSession, LiveStatus, LiveType
-from shared.models.geo import GeoZone, GeoLevel, OrderGeoClassification
+from shared.models.geo import GeoLevel, OrderGeoClassification
 
 __all__ = [
     "Product", "ProductVariant", "ProductContent", "ContentType", "PoolLevel",
@@ -19,5 +19,5 @@ __all__ = [
     "Vendor", "VendorTier",
     "Order", "OrderStatus", "OrderItem",
     "LiveSession", "LiveStatus", "LiveType",
-    "GeoZone", "GeoLevel", "OrderGeoClassification",
+    "GeoLevel", "OrderGeoClassification",
 ]

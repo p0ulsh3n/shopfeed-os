@@ -1,112 +1,274 @@
-"""Geo classification logic — zones, haversine, NLP geocoding — Section 43."""
+"""
+Geo Classification — Global Order Zone Classification (reverse_geocode + haversine).
+
+Replaces the old hardcoded 30-zone system with a 100% global offline solution.
+Works for ANY country in the world, no hardcoded zones needed.
+
+How it works:
+    1. App sends vendor lat/lon + buyer lat/lon (already tracked in React Native)
+    2. reverse_geocode resolves coordinates → city + country (offline, <1ms)
+    3. haversine calculates exact distance in km
+    4. Simple logic determines zone:
+
+    Zone A (Livraison)  → same city OR distance < 50km
+    Zone B (Expedition) → same country, different city
+    Zone C (Expedition) → different country (international)
+
+Dependencies:
+    pip install reverse_geocode
+
+Architecture:
+    - reverse_geocode: 100% offline after install, embedded GeoNames database
+    - Covers 100,000+ cities worldwide
+    - Resolution: ~1ms per lookup
+    - No API calls, no internet needed at runtime
+"""
 
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+# ── Earth distance (haversine) ────────────────────────────────────
+
+EARTH_RADIUS_KM = 6371.0
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two points on Earth."""
-    R = 6371.0  # Earth radius km
+    """Great-circle distance between two GPS coordinates on Earth.
+
+    Args:
+        lat1, lon1: Point A coordinates (degrees)
+        lat2, lon2: Point B coordinates (degrees)
+
+    Returns:
+        Distance in kilometers (float)
+    """
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+
+# ── GeoLocation result ───────────────────────────────────────────
 
 @dataclass
-class GeoZoneEntry:
-    id: int
-    country_code: str
+class GeoLocation:
+    """Resolved location from GPS coordinates."""
     city: str
-    commune: str
-    aliases: list[str]
-    center_lat: float
-    center_lon: float
+    country: str
+    country_code: str
+    latitude: float
+    longitude: float
 
 
-# Pre-loaded zones — Section 43 table
-GEO_ZONES: list[GeoZoneEntry] = [
-    # Côte d'Ivoire — Abidjan communes
-    GeoZoneEntry(1, "CI", "Abidjan", "Cocody", ["cocodie", "cocody angré", "2 plateaux", "riviera"], 5.3411, -3.9810),
-    GeoZoneEntry(2, "CI", "Abidjan", "Marcory", ["marcory zone 4", "marcory résidentiel"], 5.3050, -3.9860),
-    GeoZoneEntry(3, "CI", "Abidjan", "Plateau", ["le plateau", "plateau centre"], 5.3200, -4.0200),
-    GeoZoneEntry(4, "CI", "Abidjan", "Abobo", ["abobo gare", "abobo pk18"], 5.4300, -4.0200),
-    GeoZoneEntry(5, "CI", "Abidjan", "Yopougon", ["yop", "yopougon maroc", "yopougon wassakara"], 5.3590, -4.0780),
-    GeoZoneEntry(6, "CI", "Abidjan", "Treichville", ["treich", "treichville marché"], 5.2940, -3.9940),
-    GeoZoneEntry(7, "CI", "Abidjan", "Adjamé", ["adjamé gare"], 5.3530, -4.0200),
-    GeoZoneEntry(8, "CI", "Abidjan", "Koumassi", ["koumassi nord", "koumassi remblais"], 5.2950, -3.9570),
-    GeoZoneEntry(9, "CI", "Abidjan", "Port-Bouët", ["port bouet", "vridi"], 5.2560, -3.9610),
-    GeoZoneEntry(10, "CI", "Abidjan", "Attécoubé", ["attecoube", "atté"], 5.3350, -4.0400),
-    # Other CI cities
-    GeoZoneEntry(11, "CI", "Bouaké", "Bouaké Centre", ["bouake"], 7.6900, -5.0300),
-    GeoZoneEntry(12, "CI", "Yamoussoukro", "Yamoussoukro", ["yakro"], 6.8200, -5.2800),
-    # France
-    GeoZoneEntry(20, "FR", "Paris", "1er", ["paris 1", "les halles", "chatelet"], 48.8600, 2.3470),
-    GeoZoneEntry(21, "FR", "Paris", "11ème", ["paris 11", "oberkampf", "bastille"], 48.8590, 2.3780),
-    GeoZoneEntry(22, "FR", "Paris", "18ème", ["paris 18", "montmartre"], 48.8930, 2.3440),
-    GeoZoneEntry(23, "FR", "Lyon", "Lyon 1er", ["presqu'île", "lyon centre"], 45.7676, 4.8344),
-    GeoZoneEntry(24, "FR", "Marseille", "1er", ["vieux port", "marseille centre"], 43.2965, 5.3698),
-    # Sénégal
-    GeoZoneEntry(30, "SN", "Dakar", "Plateau", ["plateau dakar"], 14.6937, -17.4441),
-    GeoZoneEntry(31, "SN", "Dakar", "Almadies", ["almadies"], 14.7306, -17.5097),
-    GeoZoneEntry(32, "SN", "Dakar", "Parcelles Assainies", ["PA", "parcelles"], 14.7620, -17.4320),
-    # Cameroun
-    GeoZoneEntry(40, "CM", "Douala", "Douala 1er", ["akwa", "bonanjo"], 4.0511, 9.7679),
-    GeoZoneEntry(41, "CM", "Yaoundé", "Yaoundé 1er", ["centre ville yaounde"], 3.8480, 11.5023),
-    # Belgique
-    GeoZoneEntry(50, "BE", "Bruxelles", "Ixelles", ["ixelles"], 50.8275, 4.3745),
-    GeoZoneEntry(51, "BE", "Bruxelles", "Molenbeek", ["molenbeek saint jean"], 50.8561, 4.3318),
-    # Maroc
-    GeoZoneEntry(60, "MA", "Casablanca", "Anfa", ["anfa", "ain diab"], 33.5731, -7.6295),
-    GeoZoneEntry(61, "MA", "Casablanca", "Mâarif", ["maarif"], 33.5785, -7.6380),
-]
+# ── Reverse geocoding (offline, global) ──────────────────────────
 
-# Build lookup indices
-COMMUNE_LOOKUP: dict[tuple[str, str], GeoZoneEntry] = {}
-ALIAS_LOOKUP: dict[str, GeoZoneEntry] = {}
+def resolve_location(lat: float, lon: float) -> GeoLocation:
+    """Resolve GPS coordinates to city + country using offline database.
 
-for zone in GEO_ZONES:
-    COMMUNE_LOOKUP[(zone.city.lower(), zone.commune.lower())] = zone
-    ALIAS_LOOKUP[zone.commune.lower()] = zone
-    for alias in zone.aliases:
-        ALIAS_LOOKUP[alias.lower()] = zone
+    Uses reverse_geocode library (100,000+ cities worldwide, offline).
+    If reverse_geocode is not installed, returns a minimal fallback.
 
-
-def nlp_geocode_address(raw_text: str) -> tuple[GeoZoneEntry | None, float]:
-    """Parse informal addresses like "Cocody derrière Total" → commune=Cocody.
-
-    Returns (geo_zone, confidence_score).
+    Performance: <1ms per lookup (pre-loaded in memory).
     """
-    text = raw_text.lower().strip()
+    try:
+        import reverse_geocode
+        results = reverse_geocode.search([(lat, lon)])
+        if results:
+            r = results[0]
+            return GeoLocation(
+                city=r.get("city", ""),
+                country=r.get("country", ""),
+                country_code=r.get("country_code", ""),
+                latitude=lat,
+                longitude=lon,
+            )
+    except ImportError:
+        logger.warning(
+            "reverse_geocode not installed — pip install reverse_geocode. "
+            "Using coordinate-only classification."
+        )
+    except Exception as e:
+        logger.error("Reverse geocode failed for (%.4f, %.4f): %s", lat, lon, e)
 
-    # Direct alias match
-    for alias, zone in ALIAS_LOOKUP.items():
-        if alias in text:
-            return zone, 0.85
-
-    # Pattern matching for common formats
-    for zone in GEO_ZONES:
-        commune_lower = zone.commune.lower()
-        if commune_lower in text:
-            return zone, 0.80
-
-    # City-level fallback
-    for zone in GEO_ZONES:
-        if zone.city.lower() in text:
-            return zone, 0.50
-
-    return None, 0.0
+    return GeoLocation(
+        city="",
+        country="",
+        country_code="",
+        latitude=lat,
+        longitude=lon,
+    )
 
 
-def suggest_shipping(level: str, country: str, distance_km: float) -> str:
-    """Suggest shipping method based on geo level."""
-    if level == "L1":
-        return "Livraison moto express (même commune)"
-    elif level == "L2":
-        return "Livraison moto / Yango" if country == "CI" else "Colissimo standard"
-    elif level == "L3":
-        return "Wafio / Transport inter-ville" if country == "CI" else "Colissimo 48h"
+# ── Order classification ─────────────────────────────────────────
+
+@dataclass
+class OrderClassification:
+    """Result of order geo-classification."""
+    zone: str                       # "A", "B", or "C"
+    zone_label: str                 # "Livraison" or "Expedition"
+    geo_level: str                  # "L1", "L2", "L3", "L4" (backcompat)
+    distance_km: float
+    buyer_city: str
+    buyer_country: str
+    buyer_country_code: str
+    vendor_city: str
+    vendor_country: str
+    vendor_country_code: str
+    shipping_suggestion: str
+    confidence: float
+
+
+# Zone A threshold — same city OR distance less than this
+SAME_ZONE_RADIUS_KM = 50.0
+
+
+def classify_order(
+    vendor_lat: float,
+    vendor_lon: float,
+    buyer_lat: float,
+    buyer_lon: float,
+    same_zone_radius_km: float = SAME_ZONE_RADIUS_KM,
+) -> OrderClassification:
+    """Classify an order into Zone A, B, or C based on vendor/buyer coordinates.
+
+    This is the main entry point. 100% global, works for any country.
+
+    Zone logic:
+        Zone A (Livraison)  → same city OR distance < same_zone_radius_km
+            = delivery within the same area
+        Zone B (Expedition) → different city, same country
+            = national shipping
+        Zone C (Expedition) → different country
+            = international shipping
+
+    Args:
+        vendor_lat, vendor_lon: Vendor GPS coordinates
+        buyer_lat, buyer_lon: Buyer GPS coordinates
+        same_zone_radius_km: Maximum distance for Zone A (default 50km)
+
+    Returns:
+        OrderClassification with zone, distance, cities, and shipping suggestion
+    """
+    # 1. Resolve both locations (offline, <1ms each)
+    vendor_loc = resolve_location(vendor_lat, vendor_lon)
+    buyer_loc = resolve_location(buyer_lat, buyer_lon)
+
+    # 2. Calculate exact distance
+    distance = haversine_km(vendor_lat, vendor_lon, buyer_lat, buyer_lon)
+    distance = round(distance, 1)
+
+    # 3. Classify zone
+    same_country = _same_country(vendor_loc, buyer_loc)
+    same_city = _same_city(vendor_loc, buyer_loc)
+
+    if same_city or distance <= same_zone_radius_km:
+        # Zone A — Livraison (same city or very close)
+        zone = "A"
+        zone_label = "Livraison"
+        geo_level = "L1" if distance < 10 else "L2"
+        confidence = 0.99 if same_city and distance < 20 else 0.95
+        shipping = _suggest_shipping(distance, "local")
+
+    elif same_country:
+        # Zone B — Expedition nationale (different city, same country)
+        zone = "B"
+        zone_label = "Expedition"
+        geo_level = "L3"
+        confidence = 0.98
+        shipping = _suggest_shipping(distance, "national")
+
     else:
-        return "DHL Express / Colissimo International"
+        # Zone C — Expedition internationale (different country)
+        zone = "C"
+        zone_label = "Expedition"
+        geo_level = "L4"
+        confidence = 0.99
+        shipping = _suggest_shipping(distance, "international")
+
+    return OrderClassification(
+        zone=zone,
+        zone_label=zone_label,
+        geo_level=geo_level,
+        distance_km=distance,
+        buyer_city=buyer_loc.city,
+        buyer_country=buyer_loc.country,
+        buyer_country_code=buyer_loc.country_code,
+        vendor_city=vendor_loc.city,
+        vendor_country=vendor_loc.country,
+        vendor_country_code=vendor_loc.country_code,
+        shipping_suggestion=shipping,
+        confidence=confidence,
+    )
+
+
+# ── Comparison helpers ───────────────────────────────────────────
+
+def _same_country(a: GeoLocation, b: GeoLocation) -> bool:
+    """Check if two locations are in the same country."""
+    if a.country_code and b.country_code:
+        return a.country_code.upper() == b.country_code.upper()
+    if a.country and b.country:
+        return a.country.lower() == b.country.lower()
+    return False
+
+
+def _same_city(a: GeoLocation, b: GeoLocation) -> bool:
+    """Check if two locations are in the same city."""
+    if not a.city or not b.city:
+        return False
+    return a.city.lower().strip() == b.city.lower().strip()
+
+
+# ── Shipping suggestion (100% distance-based, no hardcoded countries) ──
+
+# Estimated delivery speed thresholds (km)
+_SPEED_TIERS = {
+    "express":  5,      # < 5km → express
+    "fast":     20,     # < 20km → fast local
+    "local":    50,     # < 50km → standard local
+    "regional": 200,    # < 200km → regional
+    "national": 800,    # < 800km → standard national
+    "distant":  3000,   # < 3000km → continental
+}
+
+
+def _suggest_shipping(distance_km: float, scope: str) -> str:
+    """Suggest shipping method based purely on distance and scope.
+
+    scope: "local", "national", "international"
+
+    No country codes. Works for any location in the world.
+    The estimated delivery windows are based on distance alone.
+    """
+    d = distance_km
+
+    if scope == "local":
+        # Zone A — same city or < 50km
+        if d < _SPEED_TIERS["express"]:
+            return f"Express delivery ({d:.1f}km, < 1h)"
+        if d < _SPEED_TIERS["fast"]:
+            return f"Fast delivery ({d:.1f}km, 1-3h)"
+        return f"Standard local delivery ({d:.1f}km, same day)"
+
+    if scope == "national":
+        # Zone B — same country, different city
+        if d < _SPEED_TIERS["regional"]:
+            return f"Regional shipping ({d:.0f}km, 1-2 days)"
+        if d < _SPEED_TIERS["national"]:
+            return f"National shipping ({d:.0f}km, 2-3 days)"
+        return f"Long-distance national shipping ({d:.0f}km, 3-5 days)"
+
+    # scope == "international" — Zone C
+    if d < _SPEED_TIERS["distant"]:
+        return f"International shipping ({d:.0f}km, 3-5 days)"
+    return f"International shipping ({d:.0f}km, 5-10 days)"

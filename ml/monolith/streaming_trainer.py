@@ -4,10 +4,10 @@ Streaming Trainer — Ray-based distributed online training (Section 14)
 Inspired by ByteDance's Monolith paper (2022).
 
 Architecture:
-    Kafka + Flink    → streaming event ingestion + feature engineering
-    PyTorch + Ray    → distributed online training (replaces PS)
-    Redis            → feature store serving (<5ms reads)
-    Triton           → model inference serving (updated every 5-15 min)
+    Redpanda + Flink  → streaming event ingestion + feature engineering
+    PyTorch + Ray     → distributed online training (replaces PS)
+    Redis             → feature store serving (<5ms reads)
+    Triton            → model inference serving (updated every 5-15 min)
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ class MonolithConfig:
     sync_interval_s: float = 600        # 10 min default (5-15 min range)
     checkpoint_interval_s: float = 3600  # Hourly checkpoints
 
-    # Infrastructure
-    kafka_bootstrap: str = "localhost:9092"
+    # Infrastructure — Redpanda (Kafka-compatible, archi-2026 §5)
+    redpanda_brokers: str = "redpanda-1:9092,redpanda-2:9092,redpanda-3:9092"
     kafka_topics: list[str] = field(default_factory=lambda: [
         "shopfeed.user.events",
         "shopfeed.commerce.events",
@@ -79,7 +79,7 @@ class MonolithStreamingTrainer:
     Architecture (replaces the archived bytedance/monolith):
 
         ┌──────────┐    ┌────────────────┐    ┌──────────────┐
-        │  Kafka   │ →  │  This Trainer  │ →  │    Redis     │
+        │ Redpanda │ →  │  This Trainer  │ →  │    Redis     │
         │  Topics  │    │  (PyTorch +    │    │  Feature     │
         │          │    │   Ray Train)   │    │  Store       │
         └──────────┘    └────────┬───────┘    └──────┬───────┘
@@ -397,7 +397,7 @@ class MonolithStreamingTrainer:
 
             consumer = AIOKafkaConsumer(
                 *cfg.kafka_topics,
-                bootstrap_servers=cfg.kafka_bootstrap,
+                bootstrap_servers=cfg.redpanda_brokers,
                 group_id=cfg.kafka_group_id,
                 auto_offset_reset="latest",
                 value_deserializer=lambda v: json.loads(v.decode("utf-8")),

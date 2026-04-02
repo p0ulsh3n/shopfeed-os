@@ -24,22 +24,6 @@ class ClassificationMethod(str, enum.Enum):
     MANUAL = "manual"                   # Human override
 
 
-class GeoZone(BaseModel):
-    """Geographic zone — Section 43 geo_zones table."""
-    id: int
-    country_code: str                   # ISO 3166 (CI, FR, SN, ...)
-    country_name: str
-    region: str | None = None
-    city: str
-    commune: str
-    aliases: list[str] = Field(default_factory=list)
-
-    # Centroid
-    center_lat: float = 0.0
-    center_lon: float = 0.0
-
-    adjacent_commune_ids: list[int] = Field(default_factory=list)
-    timezone: str = "Africa/Abidjan"
 
 
 class OrderGeoClassification(BaseModel):
@@ -48,7 +32,7 @@ class OrderGeoClassification(BaseModel):
     order_id: UUID
     vendor_id: UUID
 
-    buyer_country: str = "CI"
+    buyer_country: str = ""
     buyer_city: str = ""
     buyer_commune: str = ""
     buyer_lat: float | None = None

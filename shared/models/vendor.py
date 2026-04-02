@@ -48,11 +48,12 @@ class Vendor(BaseModel):
 
     is_verified: bool = False
 
-    # Geo
-    geo_zone_id: int | None = None
+    # Geo (resolved from GPS coordinates at signup)
     geo_commune: str | None = None
     geo_city: str | None = None
-    geo_country: str = "CI"
+    geo_country: str = ""                   # ISO 3166 code — set by app
+    geo_lat: float | None = None
+    geo_lon: float | None = None
 
     live_enabled: bool = False
     stripe_account_id: str | None = None
