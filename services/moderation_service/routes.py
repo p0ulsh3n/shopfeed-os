@@ -20,7 +20,7 @@ async def moderate_product(req: ModerationRequest):
 
     Pipeline:
         1. NumberGuard: check description for phone numbers → REJECT
-        2. SightEngine: check images for NSFW → REJECT
+        2. Llama Scout vision: check images for NSFW → REJECT
         3. CLIP: verify category match → HUMAN_REVIEW
         4. All clear → APPROVED
     """

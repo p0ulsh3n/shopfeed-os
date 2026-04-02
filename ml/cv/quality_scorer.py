@@ -6,7 +6,6 @@ Pipeline de scoring (2026):
         → 17B params actifs / 109B total (MoE 16 experts)
         → Multimodal natif (texte + image)
         → 1 seul A100 80GB
-        → Remplace SightEngine + Qwen2.5-VL-7B
 
 Criteres evalues:
   - Eclairage (lighting)

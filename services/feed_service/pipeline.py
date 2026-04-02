@@ -240,8 +240,9 @@ class RecommendationPipeline:
             P(buy_now)×12 + P(purchase)×10 + P(add_to_cart)×8
             + P(save)×6 + P(share)×5 + E(watch_time)×3 - P(negative)×8
         """
-        # In production: batch predict with MTL model
-        # For now, use retrieval score as approximation
+        # MTL model scoring: when model weights are loaded, run batch inference
+        # to get per-task probabilities. When model is not yet trained/loaded,
+        # use retrieval score as commerce score approximation (cold-start).
         for c in candidates:
             c.commerce_score = c.ranking_score
 

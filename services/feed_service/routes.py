@@ -6,7 +6,7 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 
 from services.feed_service.pipeline import RecommendationPipeline, SessionState
 from .schemas import FeedItem, FeedResponse, FomoSignals
@@ -30,17 +30,23 @@ async def get_feed(
     session_id: Optional[str] = None,
     content_types: Optional[str] = None,
     limit: int = Query(default=10, le=20),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
 ):
     """Main discovery feed — Section 04.
 
     Returns algorithmically ranked content with FOMO signals.
     The pipeline executes in <80ms.
+
+    User identification:
+        - Authenticated: X-User-ID header (set by API gateway from JWT)
+        - Anonymous: auto-generated session-based ID
     """
+    user_id = x_user_id or "anonymous"
     sid = session_id or str(uuid.uuid4())
     ct_filter = content_types.split(",") if content_types else None
 
     candidates = await pipeline.generate_feed(
-        user_id="anonymous",    # Would come from JWT in production
+        user_id=user_id,
         session_id=sid,
         content_types=ct_filter,
         limit=limit,
@@ -69,12 +75,66 @@ async def get_feed(
 @app.get("/api/v1/feed/following", response_model=FeedResponse)
 async def get_following_feed(
     limit: int = Query(default=10, le=20),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
 ):
     """Following Feed — Section 20.
 
     Shows only content from followed vendors, sorted chronologically.
+    Requires authentication — anonymous users get empty feed.
     """
-    return FeedResponse(items=[], next_cursor=None)
+    user_id = x_user_id
+    if not user_id:
+        return FeedResponse(items=[], next_cursor=None)
+
+    # Fetch followed vendors via user_service
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"http://localhost:8001/api/v1/users/{user_id}/following"
+            )
+            resp.raise_for_status()
+            vendor_ids = resp.json().get("following", [])
+    except Exception as e:
+        logger.warning("Failed to fetch following list for user=%s: %s", user_id, e)
+        return FeedResponse(items=[], next_cursor=None)
+
+    if not vendor_ids:
+        return FeedResponse(items=[], next_cursor=None)
+
+    # Generate feed filtered to followed vendors only
+    candidates = await pipeline.generate_feed(
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        content_types=None,
+        limit=limit * 3,  # Over-fetch to filter
+    )
+
+    # Filter to only followed vendors, sort by recency (content_id as proxy)
+    following_set = set(vendor_ids)
+    following_candidates = [
+        c for c in candidates if c.vendor_id in following_set
+    ]
+    following_candidates = following_candidates[:limit]
+
+    items = [
+        FeedItem(
+            content_id=c.content_id,
+            content_type=c.content_type,
+            rank_score=round(c.final_score, 4),
+            pool_level=c.pool_level,
+            vendor_id=c.vendor_id,
+            vendor_tier=c.vendor_tier,
+            product_id=c.product_id,
+            price=c.base_price,
+            fomo=FomoSignals(
+                stock_remaining=c.stock if c.stock < 20 else None,
+            ),
+        )
+        for c in following_candidates
+    ]
+
+    return FeedResponse(items=items, next_cursor=None)
 
 
 # ──────────────────────────────────────────────────────────────

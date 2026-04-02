@@ -134,7 +134,7 @@ def product_to_features(
     freshness = math.exp(-age_hours / 168.0)  # 7-day decay constant
     features.append(torch.tensor([freshness], dtype=torch.float32))
 
-    # 6. CV Score (1D) — SightEngine quality score (Section 15)
+    # 6. CV Score (1D) — Llama Scout multimodal quality score (Section 15)
     cv_score = float(product.get("cv_score", 0.5))
     features.append(torch.tensor([cv_score], dtype=torch.float32))
 

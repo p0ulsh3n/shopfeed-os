@@ -1,19 +1,19 @@
 """
 LightGBM Fraud Detection (archi-2026 §9.5)
 =============================================
-Detects bots, fake likes, spam comments, and fake followers using
-gradient-boosted decision trees.
+Detects bots, fake likes, spam comments, fake followers, card fraud,
+and agentic AI attacks using gradient-boosted trees + rule-based fallback.
 
 Architecture:
     Flink computes real-time fraud features → LightGBM scores each user
     → If score > 0.9 → shadowban + investigation
     → If score > 0.7 → captcha challenge
 
-Features:
-    - likes_per_minute, comment_rate, follow_burst
-    - device_fingerprint_reuse, IP sharing
-    - action_interval_std (bots are too regular)
-    - profile_completeness, account_age_hours
+2026 Best Practices (source: SEON, Sift, Stripe Radar):
+    - Behavioral biometrics (touch pressure, scroll speed, session patterns)
+    - Advanced device fingerprinting (emulator, VPN, rooted device)
+    - Velocity checks (orders/h, cards/week, addresses/week)
+    - Graph-based entity resolution (shared devices/IPs across accounts)
 
 Requires:
     pip install lightgbm>=4.3
@@ -44,41 +44,86 @@ except ImportError:
 
 
 # ── Feature Definitions ───────────────────────────────────────
+# Each feature MUST be sent by the app (React Native / Web).
+# Features are grouped by signal type for clarity.
 
 FRAUD_FEATURES = [
-    # Short-term behavior (last 10 minutes, computed by Flink)
-    "likes_per_minute",           # Normal < 5, bot > 30
-    "comments_per_minute",        # Normal < 2, spam bot > 10
-    "follows_per_minute",         # Normal < 1, follow farm > 20
-    "unique_creators_liked",      # Low diversity = bot
-    "action_interval_std",        # Very low std = automated
-    "unique_ips_10m",             # Multiple IPs = suspicious
-    # Account signals
-    "account_age_hours",          # New accounts are riskier
-    "profile_completeness",       # 0.0-1.0, empty = suspicious
-    "has_avatar",                 # Binary
-    "bio_length",                 # Short bio = less legitimate
-    "followers_count",            # Context for behavior rate
-    "following_count",            # Follow farms have high following
-    # Device signals
-    "device_fingerprint_reuse",   # Same device, multiple accounts
-    "accounts_same_ip_24h",       # IP sharing
-    "is_emulator",                # Emulators are suspicious
-    # Content signals
-    "comment_duplicate_rate",     # Same comment copy-pasted
-    "like_without_view_rate",     # Liking without watching = bot
+    # ── Short-term behavior (last 10 minutes, computed by Flink) ──
+    "likes_per_minute",             # Normal < 5, bot > 30
+    "comments_per_minute",          # Normal < 2, spam bot > 10
+    "follows_per_minute",           # Normal < 1, follow farm > 20
+    "unique_creators_liked",        # Low diversity = bot
+    "action_interval_std",          # Very low std = automated
+    "unique_ips_10m",               # Multiple IPs = suspicious
+
+    # ── Account signals ──
+    "account_age_hours",            # New accounts are riskier
+    "profile_completeness",         # 0.0-1.0, empty = suspicious
+    "has_avatar",                   # Binary
+    "bio_length",                   # Short bio = less legitimate
+    "followers_count",              # Context for behavior rate
+    "following_count",              # Follow farms have high following
+
+    # ── Device signals (sent by app) ──
+    "device_fingerprint_reuse",     # Same device, multiple accounts
+    "accounts_same_ip_24h",         # IP sharing
+    "is_emulator",                  # Emulators are suspicious
+    "is_vpn_or_proxy",              # VPN/proxy detected (via IP geolocation)
+    "is_rooted_jailbroken",         # Rooted/jailbroken device
+    "timezone_mismatch",            # GPS timezone ≠ device timezone
+    "battery_level",                # Emulators often report 100%
+    "app_install_age_hours",        # Very fresh installs are riskier
+    "screen_resolution_common",     # Unusual resolutions = emulator
+
+    # ── Behavioral biometrics (sent by app, 2026 best practice) ──
+    "touch_pressure_std",           # Bots have zero variance
+    "scroll_speed_avg",             # Bots scroll unnaturally fast
+    "session_duration_seconds",     # Very short sessions = bot
+    "screen_tap_interval_std",      # Too regular = automated
+    "typing_speed_wpm",             # Unnaturally fast = paste bot
+    "navigation_depth",             # How deep into the app (bots are shallow)
+
+    # ── Content signals ──
+    "comment_duplicate_rate",       # Same comment copy-pasted
+    "like_without_view_rate",       # Liking without watching = bot
+
+    # ── Transaction/velocity signals (for checkout fraud) ──
+    "orders_24h",                   # Rapid ordering = card fraud
+    "addresses_7d",                 # Multiple shipping addresses
+    "payment_methods_7d",           # Multiple cards = testing stolen cards
+    "failed_payments_1h",           # Failed payment velocity
+    "avg_order_value_deviation",    # Sudden high-value orders vs history
+    "shipping_billing_distance_km", # Far shipping from billing = suspicious
 ]
+
 
 # Thresholds for rule-based fallback (when LightGBM not available)
 RULE_THRESHOLDS = {
+    # Behavior
     "likes_per_minute": 30,
     "comments_per_minute": 10,
     "follows_per_minute": 20,
     "action_interval_std": 0.05,
+    # Device
     "device_fingerprint_reuse": 5,
     "accounts_same_ip_24h": 10,
+    "is_emulator": 0.5,            # Binary: 1 = emulator
+    "is_vpn_or_proxy": 0.5,        # Binary: 1 = VPN
+    "is_rooted_jailbroken": 0.5,   # Binary: 1 = rooted
+    "battery_level": 99.5,         # Always 100% = emulator
+    "app_install_age_hours": 0.5,  # Less than 30 min = very suspicious
+    # Behavioral biometrics
+    "touch_pressure_std": 0.001,   # Near-zero variance = bot
+    "scroll_speed_avg": 5000,      # Pixels/sec — inhuman speed
+    "screen_tap_interval_std": 0.01, # Too regular = bot
+    # Content
     "comment_duplicate_rate": 0.8,
     "like_without_view_rate": 0.9,
+    # Transaction
+    "orders_24h": 10,              # 10+ orders in 24h
+    "addresses_7d": 5,             # 5+ different addresses in a week
+    "payment_methods_7d": 4,       # 4+ cards in a week
+    "failed_payments_1h": 5,       # 5+ failed payments in an hour
 }
 
 
@@ -125,13 +170,16 @@ class FraudDetector:
         """Score a user for fraud probability.
 
         Args:
-            features: dict of fraud feature values (must match FRAUD_FEATURES)
+            features: dict of fraud feature values (must match FRAUD_FEATURES).
+                      The app (React Native/Web) sends these signals with
+                      every session or at key checkpoints.
 
         Returns:
             {
                 "fraud_score": float,  # 0.0 (clean) to 1.0 (definitely bot)
                 "action": str,         # "allow" | "captcha" | "shadowban" | "review"
                 "triggered_rules": [...],  # which rules fired
+                "risk_factors": {...},     # categorized risk breakdown
             }
         """
         if self.model and HAS_LIGHTGBM and HAS_NUMPY:
@@ -145,11 +193,14 @@ class FraudDetector:
         score = float(self.model.predict(feature_vec)[0])
 
         action = self._score_to_action(score)
+        risk_factors = self._compute_risk_factors(features)
+
         return {
-            "fraud_score": score,
+            "fraud_score": round(score, 4),
             "action": action,
             "method": "lightgbm",
             "triggered_rules": [],
+            "risk_factors": risk_factors,
         }
 
     def _predict_rules(self, features: dict[str, float]) -> dict[str, Any]:
@@ -157,10 +208,14 @@ class FraudDetector:
         triggered = []
         for rule, threshold in RULE_THRESHOLDS.items():
             value = features.get(rule, 0.0)
-            if value > threshold:
+            # Special handling for "low value = suspicious" rules
+            if rule in ("touch_pressure_std", "screen_tap_interval_std", "action_interval_std", "app_install_age_hours"):
+                if value > 0 and value < threshold:
+                    triggered.append(f"{rule}={value:.4f} (<{threshold})")
+            elif value > threshold:
                 triggered.append(f"{rule}={value:.2f} (>{threshold})")
 
-        # Heuristic score: 0 rules = 0.0, 1 rule = 0.3, 2 = 0.5, 3+ = 0.8+
+        # Heuristic score based on number of triggered rules
         n = len(triggered)
         if n == 0:
             score = 0.0
@@ -170,8 +225,10 @@ class FraudDetector:
             score = 0.5
         elif n == 3:
             score = 0.7
+        elif n == 4:
+            score = 0.85
         else:
-            score = min(0.95, 0.7 + n * 0.05)
+            score = min(0.98, 0.85 + n * 0.03)
 
         # Automatic escalation for extreme values
         if features.get("likes_per_minute", 0) > 100:
@@ -180,13 +237,25 @@ class FraudDetector:
         if features.get("device_fingerprint_reuse", 0) > 20:
             score = max(score, 0.95)
             triggered.append("EXTREME: device_fingerprint_reuse > 20")
+        if features.get("failed_payments_1h", 0) > 10:
+            score = max(score, 0.95)
+            triggered.append("EXTREME: failed_payments_1h > 10")
+        if features.get("is_emulator", 0) > 0.5 and features.get("is_vpn_or_proxy", 0) > 0.5:
+            score = max(score, 0.90)
+            triggered.append("COMBO: emulator + VPN")
+        if features.get("touch_pressure_std", 1.0) == 0.0 and features.get("session_duration_seconds", 999) < 5:
+            score = max(score, 0.95)
+            triggered.append("BOT: zero touch pressure + instant session")
 
+        risk_factors = self._compute_risk_factors(features)
         action = self._score_to_action(score)
+
         return {
-            "fraud_score": score,
+            "fraud_score": round(score, 4),
             "action": action,
             "method": "rules",
             "triggered_rules": triggered,
+            "risk_factors": risk_factors,
         }
 
     def _score_to_action(self, score: float) -> str:
@@ -198,6 +267,45 @@ class FraudDetector:
             return "review"
         else:
             return "allow"
+
+    @staticmethod
+    def _compute_risk_factors(features: dict[str, float]) -> dict[str, str]:
+        """Categorize risk factors for dashboard display."""
+        factors = {}
+
+        # Device risk
+        device_risk = 0
+        if features.get("is_emulator", 0) > 0.5:
+            device_risk += 3
+        if features.get("is_vpn_or_proxy", 0) > 0.5:
+            device_risk += 2
+        if features.get("is_rooted_jailbroken", 0) > 0.5:
+            device_risk += 2
+        if features.get("device_fingerprint_reuse", 0) > 3:
+            device_risk += 3
+        factors["device"] = "high" if device_risk >= 5 else "medium" if device_risk >= 2 else "low"
+
+        # Behavior risk
+        behavior_risk = 0
+        if features.get("likes_per_minute", 0) > 30:
+            behavior_risk += 3
+        if features.get("action_interval_std", 1.0) < 0.05:
+            behavior_risk += 3
+        if features.get("touch_pressure_std", 1.0) < 0.01:
+            behavior_risk += 3
+        factors["behavior"] = "high" if behavior_risk >= 5 else "medium" if behavior_risk >= 2 else "low"
+
+        # Transaction risk
+        tx_risk = 0
+        if features.get("orders_24h", 0) > 5:
+            tx_risk += 2
+        if features.get("failed_payments_1h", 0) > 3:
+            tx_risk += 3
+        if features.get("payment_methods_7d", 0) > 3:
+            tx_risk += 3
+        factors["transaction"] = "high" if tx_risk >= 5 else "medium" if tx_risk >= 2 else "low"
+
+        return factors
 
     # ── Training ───────────────────────────────────────────────
 

@@ -193,7 +193,7 @@ async def embed_user(
 @app.post(
     "/v1/embed/product",
     response_model=EmbedProductResponse,
-    summary="Product multi-modal embedding pipeline (CLIP + SightEngine + BLIP-2)",
+    summary="Product multi-modal embedding pipeline (CLIP + Llama Scout)",
     tags=["Embeddings"],
 )
 async def embed_product(
@@ -203,9 +203,8 @@ async def embed_product(
     Pipeline complet pour un produit:
     1. FashionSigLIP/CLIP → 512d visual embedding
     2. SentenceTransformer → text embedding
-    3. SightEngine → cv_score
-    4. BLIP-2 → auto_description
-    5. CLIP zero-shot → category verification
+    3. Llama Scout → cv_score + auto_description
+    4. CLIP zero-shot → category verification
     """
     t_start = time.perf_counter()
     loop = asyncio.get_event_loop()
@@ -238,7 +237,7 @@ async def embed_product(
     except Exception as e:
         logger.warning(f"Quality score failed: {e}")
 
-    # 3. Llama 4 Scout product enrichment (replaces BLIP-2 + basic tags)
+    # 3. Llama 4 Scout product enrichment (auto SEO + tags)
     #    → SEO description, auto-tags, attributes, search keywords
     try:
         from ml.llm.llm_enrichment import enrich_product

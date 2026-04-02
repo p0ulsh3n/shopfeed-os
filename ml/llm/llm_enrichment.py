@@ -29,7 +29,7 @@ def _get_router():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  1. PHOTO QUALITY SCORING (Scout vision) — replaces SightEngine
+#  1. PHOTO QUALITY SCORING (Scout vision)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def score_photo_quality(

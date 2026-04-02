@@ -1,16 +1,19 @@
 """
-ViT Content Moderation (archi-2026 §9.4)
-==========================================
-Vision Transformer for automatic content moderation.
+Content Moderation Engine (archi-2026 §9.4)
+=============================================
+Multi-level content moderation combining fast perceptual hashing
+with deep ViT classification and Llama Scout explainability.
 
-Multi-level architecture:
+Architecture:
     Level 1 — Perceptual hash (pHash) instant blocking (<1ms)
     Level 2 — ViT frame-by-frame classification (<30s after upload)
-    Level 3 — Human review for ambiguous cases (score 0.5-0.85)
+    Level 3 — Llama Scout explanation (WHY was it flagged, transparent)
+    Level 4 — Human review for ambiguous cases (score 0.5-0.85)
 
 Violation categories:
     violence, nudity, self_harm, hate_symbols,
-    dangerous_activity, spam, copyright, misinformation
+    dangerous_activity, spam, copyright, misinformation,
+    counterfeit, regulated_product, price_manipulation
 
 Requires:
     pip install transformers>=4.40 Pillow>=10
@@ -44,7 +47,7 @@ except ImportError:
     logger.warning("transformers not installed — content moderation disabled. pip install transformers>=4.40")
 
 
-# ── Violation Categories ──────────────────────────────────────
+# ── Violation Categories (expanded for marketplace 2026) ──────
 
 VIOLATION_CATEGORIES = [
     "violence",
@@ -55,6 +58,9 @@ VIOLATION_CATEGORIES = [
     "spam",
     "copyright",
     "misinformation",
+    "counterfeit",           # Fake branded products
+    "regulated_product",     # Weapons, drugs, tobacco, etc.
+    "price_manipulation",    # Fake discounts, inflated compare_at_price
 ]
 
 # Action thresholds
@@ -62,23 +68,27 @@ AUTO_REMOVE_THRESHOLD = 0.85    # Score > 0.85 → auto-remove + human review
 HUMAN_REVIEW_THRESHOLD = 0.50   # Score 0.50-0.85 → queue for human review
 ALLOW_THRESHOLD = 0.50          # Score < 0.50 → allow
 
+# Llama Scout vLLM endpoint for explainability
+LLAMA_VLLM_BASE = "http://localhost:8200/v1"
+
 
 class ContentModerator(nn.Module if HAS_TORCH else object):
-    """Vision Transformer content moderation model.
+    """Multi-level content moderation engine.
 
     Architecture:
         - Backbone: ViT-Base-Patch16-224 (pre-trained, fine-tuned on moderation data)
         - Temporal pooling: Multi-head attention over frame embeddings
         - Classifier: Linear head → per-category violation scores
+        - Explainer: Llama Scout provides human-readable explanation
 
     In production:
         1. Video uploaded → extract 16 frames uniformly
         2. Each frame → ViT backbone → 768D embedding
         3. Temporal attention pools 16 embeddings → 1 video representation
         4. Classifier outputs score [0, 1] per violation category
+        5. If flagged → Llama Scout explains WHY (transparent to vendor)
     """
 
-    # Number of frames to sample per video
     N_FRAMES = 16
     EMBED_DIM = 768  # ViT-Base output dim
 
@@ -100,7 +110,7 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
             )
             self.temporal_norm = nn.LayerNorm(self.EMBED_DIM)
 
-            # Classification head
+            # Classification head (expanded for new categories)
             self.classifier = nn.Sequential(
                 nn.Linear(self.EMBED_DIM, 256),
                 nn.GELU(),
@@ -121,7 +131,6 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
         """Lazy-load ViT backbone (frozen)."""
         if self._backbone is None and HAS_TRANSFORMERS and HAS_TORCH:
             self._backbone = ViTModel.from_pretrained(self.model_name)
-            # Freeze backbone — only fine-tune the classifier head
             for param in self._backbone.parameters():
                 param.requires_grad = False
             self._backbone.eval()
@@ -142,7 +151,6 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
         inputs = self.processor(images=frames, return_tensors="pt")
         with torch.no_grad():
             outputs = self.backbone(**inputs)
-            # CLS token embedding for each frame
             embeddings = outputs.last_hidden_state[:, 0, :]  # (N_frames, 768)
 
         return embeddings.unsqueeze(0)  # (1, N_frames, 768)
@@ -170,7 +178,7 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
         return scores
 
     def moderate_video(self, frames: list) -> dict[str, Any]:
-        """Full moderation pipeline: frames → violation scores → action.
+        """Full moderation pipeline: frames → scores → action → explanation.
 
         Args:
             frames: list of PIL.Image (16 uniformly sampled frames)
@@ -184,26 +192,26 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
             }
         """
         if not HAS_TORCH or not HAS_TRANSFORMERS:
-            logger.warning("Content moderation unavailable — allowing by default")
+            logger.warning("Content moderation unavailable — sending to human review (fail-safe)")
             return {
                 "scores": {cat: 0.0 for cat in VIOLATION_CATEGORIES},
                 "max_score": 0.0,
                 "max_category": "none",
-                "action": "allow",
-                "error": "dependencies not installed",
+                "action": "review",
+                "error": "dependencies not installed — queued for human review",
             }
 
         try:
             embeddings = self.extract_frame_embeddings(frames)
             if embeddings is None:
-                return {"action": "allow", "error": "embedding failed"}
+                return {"action": "review", "error": "embedding failed — queued for human review"}
 
             self.eval()
             with torch.no_grad():
                 scores_tensor = self.forward(embeddings)
 
             scores = {
-                cat: float(scores_tensor[0, i])
+                cat: round(float(scores_tensor[0, i]), 4)
                 for i, cat in enumerate(VIOLATION_CATEGORIES)
             }
 
@@ -219,14 +227,57 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
 
             return {
                 "scores": scores,
-                "max_score": max_score,
+                "max_score": round(max_score, 4),
                 "max_category": max_category,
                 "action": action,
             }
 
         except Exception as e:
-            logger.error("Moderation failed: %s", e)
+            logger.error("Moderation failed: %s — sending to human review", e)
             return {"action": "review", "error": str(e)}
+
+    async def explain_violation(
+        self,
+        product_title: str,
+        image_url: str,
+        scores: dict[str, float],
+        action: str,
+    ) -> dict[str, Any]:
+        """Level 3: Llama Scout explains WHY content was flagged.
+
+        Called after ViT scoring when action is 'review' or 'remove'.
+        Provides vendor-friendly, transparent explanations.
+
+        Returns:
+            {
+                "explanation": "This image was flagged because...",
+                "severity": "low" | "medium" | "high" | "critical",
+                "suggested_fixes": ["Crop the image to...", "Replace background..."],
+                "false_positive_likelihood": 0.0-1.0,
+                "appeal_recommendation": "approve" | "needs_review" | "reject"
+            }
+        """
+        try:
+            from ml.llm.llm_enrichment import explain_moderation
+            result = await explain_moderation(
+                product_title=product_title,
+                image_url=image_url,
+                moderation_scores=scores,
+                flagged_reasons=[
+                    cat for cat, score in scores.items()
+                    if score >= HUMAN_REVIEW_THRESHOLD
+                ],
+            )
+            return result
+        except Exception as e:
+            logger.error("Llama explanation failed: %s", e)
+            return {
+                "explanation": "Automated review flagged potential policy violation.",
+                "severity": "medium",
+                "suggested_fixes": ["Please review your content against our policies."],
+                "false_positive_likelihood": 0.5,
+                "appeal_recommendation": "needs_review",
+            }
 
 
 # ── Perceptual Hash — Level 1 Instant Block ────────────────────
@@ -248,9 +299,36 @@ class PerceptualHashChecker:
         """Add a content hash to the block list."""
         self._blocked_hashes.add(phash)
 
+    def remove_blocked_hash(self, phash: str) -> None:
+        """Remove a content hash from the block list."""
+        self._blocked_hashes.discard(phash)
+
     def check_frame(self, frame_hash: str) -> bool:
         """Returns True if the frame matches a blocked hash."""
         return frame_hash in self._blocked_hashes
+
+    def check_hamming_distance(self, hash1: str, hash2: str, threshold: int = 10) -> bool:
+        """Check if two hashes are similar within Hamming distance threshold.
+
+        Perceptual hashes that differ by < threshold bits are considered
+        the same image (robust to compression, resizing, minor edits).
+        """
+        if len(hash1) != len(hash2):
+            return False
+        try:
+            val1 = int(hash1, 16)
+            val2 = int(hash2, 16)
+            distance = bin(val1 ^ val2).count("1")
+            return distance <= threshold
+        except ValueError:
+            return False
+
+    def check_frame_fuzzy(self, frame_hash: str, threshold: int = 10) -> bool:
+        """Check if frame matches ANY blocked hash within Hamming distance."""
+        for blocked in self._blocked_hashes:
+            if self.check_hamming_distance(frame_hash, blocked, threshold):
+                return True
+        return False
 
     @staticmethod
     def compute_phash(image: Any, hash_size: int = 16) -> str:
