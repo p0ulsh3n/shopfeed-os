@@ -53,8 +53,13 @@ class Order(BaseModel):
     status: OrderStatus = OrderStatus.PENDING
     items: list[OrderItem] = Field(default_factory=list)
     total_gmv: float = 0.0
-    currency: str = "EUR"
+    currency: str = ""                      # ISO 4217 — set at checkout from vendor
     shipping_address: ShippingAddress = Field(default_factory=ShippingAddress)
+
+    # Shipping costs (calculated by shipping_calculator)
+    shipping_cost: float = 0.0
+    shipping_breakdown: list[dict] = Field(default_factory=list)
+
     payment_method: str | None = None
     payment_status: PaymentStatus = PaymentStatus.PENDING
     tracking_number: str | None = None

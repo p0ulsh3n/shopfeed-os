@@ -67,17 +67,59 @@ class ProductVariant(BaseModel):
 
 class PhotoMeta(BaseModel):
     url: str
-    cv_score: float | None = None           # SightEngine quality [0,1]
+    cv_score: float | None = None
     clip_embedding: list[float] | None = None  # 512-dim
-    caption: str | None = None              # BLIP-2 auto-generated
+    caption: str | None = None
+
+
+class ShippingRateTier(BaseModel):
+    """Weight tier within a shipping zone rate.
+
+    Example: 0-2000g → base_price 1500 FCFA, then +500/kg above.
+    """
+    min_weight_g: int = 0               # Minimum weight (grams, inclusive)
+    max_weight_g: int = 2000            # Weight covered by base_price
+    base_price: float = 0.0             # Base price for this tier
+    price_per_extra_kg: float = 0.0     # Price per additional kg above max_weight_g
+
+
+class ShippingZoneRate(BaseModel):
+    """Vendor-defined rate for one geographic zone (A, B, or C).
+
+    Zone A = same city (Livraison)
+    Zone B = same country, different city (Expedition nationale)
+    Zone C = different country (Expedition internationale)
+
+    Vendors configure these in their dashboard.
+    """
+    zone: str                           # "A", "B", or "C"
+    tiers: list[ShippingRateTier] = Field(
+        default_factory=lambda: [ShippingRateTier()],
+    )
+    free_above: float | None = None     # Free shipping if order > this amount
+    enabled: bool = True                # Does vendor ship to this zone?
 
 
 class ShippingConfig(BaseModel):
-    free: bool = False
-    free_above: float | None = None         # Free shipping above X€
-    flat_rate: float | None = None
-    zones: list[str] = Field(default_factory=list)   # Country codes served
-    express_options: list[str] = Field(default_factory=list)
+    """Vendor shipping configuration.
+
+    Each vendor defines their own rates per zone.
+    If zone_rates is empty, platform defaults apply.
+
+    Example JSON a vendor would configure:
+    {
+        "zone_rates": [
+            {"zone": "A", "tiers": [{"max_weight_g": 2000, "base_price": 1500, "price_per_extra_kg": 500}], "free_above": 50000},
+            {"zone": "B", "tiers": [{"max_weight_g": 1000, "base_price": 3000, "price_per_extra_kg": 1000}]},
+            {"zone": "C", "tiers": [{"max_weight_g": 500, "base_price": 25000, "price_per_extra_kg": 5000}]}
+        ],
+        "package_weight_g": 100,
+        "processing_days": 3
+    }
+    """
+    zone_rates: list[ShippingZoneRate] = Field(default_factory=list)
+    package_weight_g: int = 100         # Weight of packaging added to each shipment
+    processing_days: int = 3            # Days to prepare the shipment
 
 
 class Product(BaseModel):
@@ -94,7 +136,7 @@ class Product(BaseModel):
     brand: str | None = None
     base_price: float
     compare_at_price: float | None = None
-    currency: str = "EUR"
+    currency: str = ""                      # ISO 4217 — resolved from vendor GPS
     base_stock: int = 0
     has_variants: bool = False
 

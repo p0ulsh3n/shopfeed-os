@@ -35,7 +35,7 @@ class ClassifyResponse(BaseModel):
 
     # Zone classification
     zone: str = Field(..., description="A, B, or C")
-    zone_label: str = Field(..., description="Livraison or Expedition")
+    zone_label: str = Field(..., description="local_delivery / national_shipping / international_shipping")
     geo_level: str = Field(..., description="L1/L2/L3/L4 (backward compatible)")
 
     # Distance

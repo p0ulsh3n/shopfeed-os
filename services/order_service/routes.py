@@ -24,7 +24,11 @@ from shared.db import get_kafka_producer
 from shared.events import Topic, CommerceEvent, CommerceEventType
 from shared.models.order import OrderStatus, PaymentStatus
 
-from .schemas import AddToCartRequest, CheckoutRequest, UpdateStatusRequest
+from .schemas import (
+    AddToCartRequest, CheckoutRequest, UpdateStatusRequest,
+    EstimateShippingRequest, EstimateShippingResponse, VendorShippingDetail,
+)
+from .shipping_calculator import calculate_cart_shipping
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,7 @@ async def add_to_cart(user_id: str, req: AddToCartRequest):
 async def get_cart(user_id: str):
     cart = _carts.get(user_id, [])
     total = sum(item["unit_price"] * item["quantity"] for item in cart)
-    return {"items": cart, "total": round(total, 2), "currency": "EUR"}
+    return {"items": cart, "total": round(total, 2), "currency": ""}
 
 
 @app.delete("/api/v1/cart/{user_id}")
@@ -96,7 +100,7 @@ async def checkout(req: CheckoutRequest):
         "status": OrderStatus.PENDING,
         "items": cart.copy(),
         "total_gmv": round(total, 2),
-        "currency": "EUR",
+        "currency": "",
         "shipping_address": {
             "name": req.shipping_name,
             "phone": req.shipping_phone,
@@ -124,9 +128,41 @@ async def checkout(req: CheckoutRequest):
     # Previously: CommerceEvent was imported but NEVER published.
     await _publish_purchase_events(req.buyer_id, order_id, cart, primary_vendor_id)
 
+    # ── Calculate shipping costs ──
+    shipping_result = calculate_cart_shipping(
+        cart_items=cart,
+        buyer_lat=req.shipping_lat,
+        buyer_lon=req.shipping_lon,
+    )
+
+    order["shipping_cost"] = shipping_result.total_shipping_cost
+    order["shipping_breakdown"] = [
+        {
+            "vendor_id": v.vendor_id,
+            "zone": v.zone,
+            "zone_label": v.zone_label,
+            "total_weight_g": v.total_weight_g,
+            "shipping_cost": v.shipping_cost,
+            "is_free": v.is_free,
+            "distance_km": v.distance_km,
+        }
+        for v in shipping_result.vendors
+    ]
+    order["total_gmv"] = round(total + shipping_result.total_shipping_cost, 2)
+
+    logger.info(
+        "Shipping: %d vendors, shipping=%.2f, total=%.2f",
+        shipping_result.vendor_count,
+        shipping_result.total_shipping_cost,
+        order["total_gmv"],
+    )
+
     return {
         "order_id": order_id,
-        "total": total,
+        "items_total": round(total, 2),
+        "shipping_cost": shipping_result.total_shipping_cost,
+        "grand_total": order["total_gmv"],
+        "shipping_breakdown": order["shipping_breakdown"],
         "status": "pending",
         "payment_url": (
             f"https://checkout.stripe.com/pay/{order_id}"
@@ -219,3 +255,46 @@ async def list_orders(buyer_id: str | None = None, vendor_id: str | None = None)
     if vendor_id:
         orders = [o for o in orders if o.get("vendor_id") == vendor_id]
     return {"orders": orders, "total": len(orders)}
+
+
+# ── Shipping Estimate (pre-checkout preview) ────────────────────
+
+@app.post("/api/v1/orders/estimate-shipping", response_model=EstimateShippingResponse)
+async def estimate_shipping(req: EstimateShippingRequest):
+    """Preview shipping costs before checkout.
+
+    Called from the cart page to show per-vendor shipping breakdown
+    and free shipping hints ("Add X more for free shipping").
+    """
+    result = calculate_cart_shipping(
+        cart_items=req.items,
+        vendors_configs=req.vendors_configs,
+        buyer_lat=req.buyer_lat,
+        buyer_lon=req.buyer_lon,
+    )
+
+    return EstimateShippingResponse(
+        total_shipping_cost=result.total_shipping_cost,
+        total_items_cost=result.total_items_cost,
+        grand_total=result.grand_total,
+        vendor_count=result.vendor_count,
+        vendors=[
+            VendorShippingDetail(
+                vendor_id=v.vendor_id,
+                zone=v.zone,
+                zone_label=v.zone_label,
+                total_weight_g=v.total_weight_g,
+                item_count=v.item_count,
+                subtotal=v.subtotal,
+                shipping_cost=v.shipping_cost,
+                is_free=v.is_free,
+                free_reason=v.free_reason,
+                distance_km=v.distance_km,
+                vendor_city=v.vendor_city,
+                buyer_city=v.buyer_city,
+                shipping_suggestion=v.shipping_suggestion,
+            )
+            for v in result.vendors
+        ],
+        free_shipping_hints=result.free_shipping_hints,
+    )

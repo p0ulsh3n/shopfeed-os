@@ -115,7 +115,7 @@ def resolve_location(lat: float, lon: float) -> GeoLocation:
 class OrderClassification:
     """Result of order geo-classification."""
     zone: str                       # "A", "B", or "C"
-    zone_label: str                 # "Livraison" or "Expedition"
+    zone_label: str                 # "local_delivery" / "national_shipping" / "international_shipping"
     geo_level: str                  # "L1", "L2", "L3", "L4" (backcompat)
     distance_km: float
     buyer_city: str
@@ -174,7 +174,7 @@ def classify_order(
     if same_city or distance <= same_zone_radius_km:
         # Zone A — Livraison (same city or very close)
         zone = "A"
-        zone_label = "Livraison"
+        zone_label = "local_delivery"
         geo_level = "L1" if distance < 10 else "L2"
         confidence = 0.99 if same_city and distance < 20 else 0.95
         shipping = _suggest_shipping(distance, "local")
@@ -182,7 +182,7 @@ def classify_order(
     elif same_country:
         # Zone B — Expedition nationale (different city, same country)
         zone = "B"
-        zone_label = "Expedition"
+        zone_label = "national_shipping"
         geo_level = "L3"
         confidence = 0.98
         shipping = _suggest_shipping(distance, "national")
@@ -190,7 +190,7 @@ def classify_order(
     else:
         # Zone C — Expedition internationale (different country)
         zone = "C"
-        zone_label = "Expedition"
+        zone_label = "international_shipping"
         geo_level = "L4"
         confidence = 0.99
         shipping = _suggest_shipping(distance, "international")

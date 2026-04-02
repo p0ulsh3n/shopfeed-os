@@ -23,7 +23,7 @@ class FeedItem(BaseModel):
     vendor_tier: str = "bronze"
     product_id: str
     price: float = 0.0
-    currency: str = "EUR"
+    currency: str = ""
     media_url: str = ""
     thumbnail_url: str = ""
     fomo: FomoSignals = Field(default_factory=FomoSignals)

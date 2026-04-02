@@ -5,13 +5,34 @@ from __future__ import annotations
 import re
 
 
-# Patterns for phone numbers in various formats
+# Patterns for phone numbers in various global formats
 _PHONE_PATTERNS = [
-    r"(\+?\d{1,3}[\s-]?\d{2,3}[\s-]?\d{2,3}[\s-]?\d{2,4})",   # International: +225 07 89 12 34
-    r"(0[1-9]\d{8})",                                             # French: 0612345678
-    r"(\d{2}\s\d{2}\s\d{2}\s\d{2}\s\d{2})",                     # Spaced: 07 89 12 34 56
-    r"(whatsapp|watsap|whats\s*app|wa\.me)",                      # WhatsApp keywords
-    r"(@gmail|@yahoo|@hotmail|@outlook)",                          # Email to bypass
+    # International with country code: +225 07 89 12 34, +1-555-123-4567
+    r"(\+?\d{1,3}[\s\-.]?\d{2,4}[\s\-.]?\d{2,4}[\s\-.]?\d{2,4})",
+    # French: 06/07 + 8 digits
+    r"(0[1-9]\d{8})",
+    # Spaced FR: 07 89 12 34 56
+    r"(\d{2}\s\d{2}\s\d{2}\s\d{2}\s\d{2})",
+    # US/Canada: (555) 123-4567 or 555.123.4567
+    r"(\(\d{3}\)\s?\d{3}[\s\-.]?\d{4})",
+    # UK: 07xxx xxxxxx
+    r"(07\d{3}\s?\d{6})",
+    # Nigeria/Ghana: 080x xxx xxxx, 024x xxx xxxx
+    r"(0[2-9]\d{1,2}\s?\d{3}\s?\d{4})",
+    # Arabic numerals phone (٠١٢٣٤٥٦٧٨٩)
+    r"([٠-٩]{10,11})",
+    # Social media bypass keywords (all languages)
+    r"(whatsapp|watsap|whats\s*app|wa\.me|watsapp)",
+    r"(telegram|t\.me|telegrm|telegrame)",
+    r"(signal|viber|imo\b)",
+    r"(wechat|weixin|微信)",
+    r"(instagram\s*dm|insta\s*dm|snap\s*chat|snapchat)",
+    r"(appelle[z]?\s*moi|call\s*me|اتصل\s*بي|contactez)",
+    # Email bypass
+    r"(@gmail|@yahoo|@hotmail|@outlook|@proton|@icloud|@aol)",
+    # Obfuscated numbers: zero-sept-huit or z3r0
+    r"(zero|un|deux|trois|quatre|cinq|six|sept|huit|neuf)[\s\-]+"
+    r"(zero|un|deux|trois|quatre|cinq|six|sept|huit|neuf)",
 ]
 
 

@@ -255,7 +255,10 @@ async def conversational_search(
     → {category: "robes", attributes: {season: "ete", material: "soie"}, price_range: {max: 200}}
     """
     router = _get_router()
-    cats = ", ".join(available_categories or ["mode", "food", "maison", "beaute", "tech"])
+    cats = ", ".join(available_categories or [
+        "fashion", "beauty", "electronics", "home", "food",
+        "sports", "baby", "automotive", "health",
+    ])
 
     prompt = f"""Convert this search query into structured product filters.
 Query: "{user_query}"

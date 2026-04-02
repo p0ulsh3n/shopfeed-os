@@ -17,7 +17,7 @@ class CreateProductRequest(BaseModel):
     brand: str | None = None
     base_price: float
     compare_at_price: float | None = None
-    currency: str = "EUR"
+    currency: str = ""                      # ISO 4217 — set from vendor's country
     base_stock: int = 0
     tags: list[str] = []
     weight_g: int | None = None

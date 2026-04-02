@@ -10,7 +10,7 @@ class SearchResult(BaseModel):
     title: str
     vendor_name: str = ""
     price: float = 0.0
-    currency: str = "EUR"
+    currency: str = ""
     thumbnail_url: str = ""
     content_type: str = "photo"
     is_live: bool = False                   # True if vendor is streaming NOW
