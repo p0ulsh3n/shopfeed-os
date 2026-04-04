@@ -1,4 +1,4 @@
-# Live Streaming Infrastructure — Hetzner + OVH + CDN
+﻿# Live Streaming Infrastructure — Hetzner + OVH + CDN
 ## Architecture de Production Optimisée : Phase 1 → Phase 3
 
 > **Référentiel :** Senior Infra Engineer · Pattern TikTok / Taobao Live
@@ -39,7 +39,7 @@ L'Intel i5-13500 possède l'**UHD Graphics 770**, avec **2 Multi-Format Codec En
 - **Performance réelle :** 1 serveur EX44 = 15 à 20 flux complets `_ld5`+`_sd5`+`_zsd5`+`_hd5` simultanés, CPU à <10%
 - **Low Latency absolu :** `-async_depth 1` + `-look_ahead 0` réduisent le délai RTMP→FLV au minimum
 - **Stabilité thermique :** Le moteur QSV intégré ne "throttle" jamais sous charge 24h/24 continue
-- **Coût imbattable :** €47.30/mois · ~2.4 €/stream/mois (15-20 streams actifs)
+- **Cout :** 49.00 EUR/mois (47.30 + 1.70 IPv4) + 99 EUR setup -- soit ~3.3 EUR/stream/mois (15 streams actifs)
 - **AV1 : décodage OK, encodage NON** — l'i5-13500 décode l'AV1 hardware mais ne peut pas l'encoder. On reste sur H.264 QSV pour l'output live.
 
 ### 4. Drivers Linux requis (Red Flag à éviter)
@@ -193,7 +193,7 @@ exec ffmpeg \
                ┌────────────────────────────────┐
                │  Orchestrateur Flask + Redis    │
                │  OVH Rise-1 · port :8085        │
-               │  Redis CPX22 · 10.0.4.1         │
+               │  Redis CPX11 · 10.0.4.1         │
                │  → sélectionne EX44 disponible  │
                │  → spawn FFmpeg sur le worker   │
                └────────────────┬───────────────┘
@@ -321,9 +321,9 @@ exec ffmpeg \
 ║  └─────────────────────────────────────────────────────────────┘     ║
 ║                                                                       ║
 ║  ┌─────────────────────┐  ┌────────────────────────────────────┐     ║
-║  │   AX41-NVMe         │  │   CPX22 (Redis)                    │     ║
-║  │   Monitoring        │  │   2 vCPU · 4 GB · €7.99/mois       │     ║
-║  │   Prometheus        │  │   État orchestrateur               │     ║
+║  │   AX41-NVMe         │  │   CPX11 (Redis)                    │     ║
+║  │   Monitoring        │  │   2 vCPU · 2 GB · 4.99 EUR/mois    │     ║
+║  │   Prometheus        │  │   Etat orchestrateur               │     ║
 ║  │   Grafana           │  │   Pool workers QSV                 │     ║
 ║  │   AlertManager      │  │   IP : 10.0.4.1                    │     ║
 ║  │   intel_gpu_top     │  └────────────────────────────────────┘     ║
@@ -489,8 +489,54 @@ Débit moyen par viewer (distribution ABR) :
 | **1 000** | **872 GB** | **78 480 GB** | **~$392** | **~€1 570** |
 | 60 000 (pic) | 52 320 GB | événement 2h | ~$523 (~€481/event) | ~€2 093/event |
 
-> **Stratégie régionale :** Gcore pour Afrique/Asie (~€0.020/GB vs Bunny $0.060/GB Afrique = 3× moins cher).
-> Bunny pour Europe/USA ($0.010/GB standard · $0.005/GB volume >100TB/mois).
+> **Strategie regionale :** Gcore pour Afrique/Asie (~0.020 EUR/GB vs Bunny $0.060/GB Afrique = 3x moins cher).
+> Bunny pour Europe/USA ($0.010/GB standard, $0.005/GB volume >100TB/mois).
+
+### 2.6 Prix CDN verifies (avril 2026)
+
+Sources : bunny.net/pricing, gcore.com/pricing/cdn, cloudflare.com/plans
+
+**Bunny CDN -- Standard Network (119 PoPs, pricing par region) :**
+
+| Region | Prix/GB |
+|--------|---------|
+| Europe et Amerique du Nord | $0.010/GB |
+| Asie et Oceanie | $0.030/GB |
+| Amerique du Sud | $0.045/GB |
+| Moyen-Orient et Afrique | $0.060/GB |
+
+**Bunny CDN -- Volume Network (10 PoPs, tarif unique global) :**
+
+| Volume mensuel | Prix/GB |
+|---------------|---------|
+| < 500 TB | $0.005/GB |
+| 500 TB - 1 PB | $0.004/GB |
+| 1 PB - 2 PB | $0.002/GB |
+| > 2 PB | Sur devis |
+
+Minimum mensuel : $1.00. Pas de frais par requete HTTP. Transcodage Bunny Stream : gratuit.
+
+**Gcore CDN (210+ PoPs, trafic global unifie sans surcharge regionale) :**
+
+| | FREE | START | PRO | Enterprise |
+|--|------|-------|-----|-----------|
+| Prix/mois | 0 EUR | 35 EUR | 100 EUR | Sur devis |
+| Trafic inclus | 1 TB | 1.5 TB | 5 TB | Sur devis |
+| Overage/GB | 0.030 EUR | 0.023 EUR | 0.020 EUR | Sur devis |
+| PoPs | 210+ | 210+ | 210+ | Sur devis |
+
+Gcore Managed DNS : FREE = 0 EUR/mois (requetes illimitees, 1 health check, GeoDNS inclus). PRO = 2.49 EUR/mois (10M requetes, 5 health checks).
+
+**Cloudflare :**
+
+| Plan | Prix/mois | DNS | CDN | DDoS |
+|------|----------|-----|-----|------|
+| Free | 0 USD | Inclus | Inclus | Illimite |
+| Pro | 20 USD (annuel) / 25 USD (mensuel) | Inclus | Inclus | Illimite |
+| Business | 200 USD (annuel) / 250 USD (mensuel) | Inclus | Inclus | Illimite |
+
+Cloudflare Load Balancer : 5 USD/mois (2 origins, 500K requetes incluses, 0.50 USD par 500K supplementaires).
+Cloudflare Geo Steering (add-on) : +10 USD/mois. Total Geo DNS avec 2 pools : **~15 USD/mois**.
 
 ---
 
@@ -518,23 +564,46 @@ Note MVP réel : taux actifs ~40% au démarrage
 
 > **Optimisation Phase 1 :** Commencer avec **20 EX44** (taux 60% → 300 streams). Scaler si besoin.
 
-### 3.3 Serveurs Phase 1 — Prix réels 2026
+### 3.3 Serveurs Phase 1 — Prix reels verifies (avril 2026)
 
-| Rôle | Modèle | Qte | Specs | Prix unitaire | Total/mois |
-|------|--------|-----|-------|--------------|------------|
-| SRS Origin | **OVH Rise-1** | **1** | Xeon-E 2336 · 32 GB · 500 Mbps garanti | **~€65** | **€65** |
-| FFmpeg QSV | **Hetzner EX44** | **20** | i5-13500 · 64 GB · Intel QSV | **€47.30** | **€946** |
-| SRS Edge | **OVH Rise-2 + 2Gbps** | **3** | Xeon-E 2388G · 64 GB · 2 Gbps garanti | **~€100-110*** | **~€310** |
-| Monitoring | Hetzner AX41-NVMe | **1** | Ryzen · 32 GB · Prometheus + Grafana | **€42.30** | €42.30 |
-| Redis | Hetzner Cloud CPX22 | **1** | 2 vCPU · 4 GB · état orchestrateur | **€7.99** | €8 |
-| Cloudflare | Geo DNS/LB | — | ~2 origin pools | — | ~€15 |
-| **Sous-total serveurs** | | | | | **~€1 386** |
-| Bunny CDN EU/USA | Pay-as-you-go | — | $0.010/GB standard · $0.005/GB volume | variable | €200-1 000 |
-| Gcore CDN Afrique | PRO plan | — | €100/mois + €0.020/GB overage | variable | €100-400 |
-| **TOTAL Phase 1** | | | | | **~€1 686-2 786/mois** |
+Tous les prix ci-dessous sont HT et ont ete verifies via simulation de commande sur les sites OVH et Hetzner en avril 2026.
 
-> *\* Prix Rise-2 base ~€73/mois + option 2 Gbps garanti ~€30-40/mois selon datacenter OVH. **À vérifier en checkout OVH pour votre région.***
-> **Économie vs ancien design GEX44+GAME-2 (~€5 134/mois) : −EUR 3 748/mois = −73%.**
+| Role | Modele | Qte | Specs | Prix mensuel HT | Setup (une fois) | Total/mois |
+|------|--------|-----|-------|-----------------|-------------------|------------|
+| SRS Origin | **OVH Rise-1** | **1** | Xeon-E 2386G · 32 GB DDR4 ECC · 2x 512 GB NVMe · 1 Gbit/s illimite | **48.44 EUR** | 56.99 EUR (1er mois) | **48.44 EUR** |
+| FFmpeg QSV | **Hetzner EX44** (Allemagne) | **20** | i5-13500 · 64 GB DDR4 · 2x 512 GB NVMe · 1 Gbit/s · QSV UHD 770 | **49.00 EUR** (47.30 + 1.70 IPv4) | 99.00 EUR par serveur | **980 EUR** |
+| SRS Edge | **OVH Rise-2** | **3** | Xeon-E 2388G · 32 GB DDR4 ECC · 2x 512 GB NVMe · 1 Gbit/s garanti | **55.24 EUR** | 64.99 EUR (1er mois) | **165.72 EUR** |
+| Option 2 Gbps public (Edge) | OVH option reseau | **3** | Upgrade bande passante 1 Gbps vers 2 Gbps garanti | **~100 EUR** | — | **~300 EUR** |
+| HAProxy (x2) | **Hetzner CX33** | **2** | 4 vCPU · 8 GB · Keepalived HA | **6.99 EUR** (6.49 + 0.50 IPv4) | 0 EUR | **13.98 EUR** |
+| Monitoring | Hetzner AX41-NVMe (Allemagne) | **1** | AMD Ryzen 5 3600 · 64 GB DDR4 · 2x 512 GB NVMe · Prometheus + Grafana + Loki | **44.00 EUR** (42.30 + 1.70 IPv4) | 0 EUR (promo) | **44.00 EUR** |
+| Redis | Hetzner Cloud CPX11 | **1** | 2 vCPU AMD · 2 GB RAM · 40 GB SSD | **4.99 EUR** (4.49 + 0.50 IPv4) | 0 EUR | **4.99 EUR** |
+| Cloudflare | Geo DNS | — | 2 origin pools | — | — | ~15 EUR |
+| **Sous-total serveurs** | | | | | | **~1 569 EUR** |
+| Bunny CDN EU/USA | Pay-as-you-go | — | $0.010/GB standard · $0.005/GB volume | variable | — | 200-1 000 EUR |
+| Gcore CDN Afrique | PRO plan | — | 100 EUR/mois + 0.020 EUR/GB overage | variable | — | 100-400 EUR |
+| **TOTAL Phase 1** | | | | | | **~1 869-2 969 EUR/mois** |
+
+Notes importantes sur les prix :
+- **OVH** : les prix affiches incluent la promo -15% en cours (avril 2026). Les prix sans promo sont Rise-1 = 56.99 EUR, Rise-2 = 64.99 EUR. Les frais d'installation sont inclus dans le montant du 1er mois.
+- **Option 2 Gbps OVH** : cette option se configure dans le Control Panel OVH apres livraison du serveur, ou via l'API OVH. Elle concerne uniquement la bande passante publique. La bande passante privee (vRack) est a 10 EUR/mois pour 2 Gbps.
+- **Hetzner CX33** : pas de frais d'installation. Facturation a l'heure possible (0.0104 EUR/h). 20 TB de trafic inclus, puis 1 EUR/TB.
+
+**Hetzner EX44 -- prix detailles (verifies sur robot.hetzner.com, avril 2026) :**
+
+Les prix HT sont ceux affiches sur le configurateur (hetzner.com/dedicated-rootserver/ex44/configurator).
+Les prix TTC sont ceux affiches sur la page de commande Robot (robot.hetzner.com/order) et incluent la TVA allemande de 19%.
+
+| | Allemagne (FSN1) HT | Allemagne (FSN1) TTC | Finlande (HEL1) HT | Finlande (HEL1) TTC |
+|--|---------------------|---------------------|--------------------|--------------------|
+| Serveur de base | 47.30 EUR/mois | 56.29 EUR/mois | 42.30 EUR/mois | 50.34 EUR/mois |
+| Primary IPv4 | 1.70 EUR/mois | 2.02 EUR/mois | 1.70 EUR/mois | 2.02 EUR/mois |
+| **Total mensuel** | **49.00 EUR/mois** | **58.31 EUR/mois** | **44.00 EUR/mois** | **52.36 EUR/mois** |
+| Frais d'installation | 99.00 EUR (une fois) | 117.81 EUR (une fois) | 99.00 EUR (une fois) | 117.81 EUR (une fois) |
+| **1er mois total** | **148.00 EUR** | **176.12 EUR** | **143.00 EUR** | **170.17 EUR** |
+| Tarif horaire | 0.0785 EUR/h | 0.0934 EUR/h | 0.0705 EUR/h | 0.0839 EUR/h |
+
+Pour la Finlande, le support est uniquement en anglais. Le Rescue System est en anglais.
+Si tu es enregistre en tant qu'entreprise dans l'UE avec un numero de TVA intracommunautaire valide, les prix HT s'appliquent (reverse charge). Sinon, tu payes le TTC.
 
 ### 3.4 HAProxy — Load Balancer Ingest (Production (Keepalived HA))
 
@@ -834,7 +903,7 @@ Ce que Redis stocke concretement :
 
 Lorsqu'un EX44 tombe (crash), l'orchestrateur detecte via Prometheus que ce worker est `down`, decremente son compteur dans Redis, et les prochains streams sont automatiquement routing vers les autres workers. Les streams en cours sur le worker crashe sont perdus, mais le lazy transcoding les relancera des que le premier viewer se reconnecte.
 
-Redis n'a pas besoin d'etre puissant : un CPX11 Hetzner (2 vCPU, 2 GB RAM, 3.79 euro/mois) suffit pour stocker l'etat de 5000 streams simultanement. La seule contrainte est la disponibilite : c'est pourquoi on sauvegarde le dump RDB toutes les heures.
+Redis n'a pas besoin d'etre puissant : un CPX11 Hetzner (2 vCPU AMD, 2 GB RAM, 4.99 EUR/mois avec IPv4) suffit pour stocker l'etat de 5000 streams simultanement. En Phase 2+, on passe à un CPX32 (4 vCPU, 8 GB RAM, 14.49 EUR/mois) en cluster HA pour de la redundance. La seule contrainte est la disponibilite : c'est pourquoi on sauvegarde le dump RDB toutes les heures.
 
 ### 3.7 Orchestrateur Flask + Redis + Supervisor
 
@@ -1095,18 +1164,16 @@ EX44 = 800 / 15 = 53 + 5 buffer = 58 EX44
 
 ### 4.2 Serveurs Phase 2
 
-| Rôle | Modèle | Qte | Prix unit. | Total/mois |
-|------|--------|-----|-----------|------------|
-| SRS Origin | OVH Rise-1 | **2** (HA) | ~€65 | €130 |
-| FFmpeg QSV | Hetzner EX44 | **50** | €47.30 | €2 365 |
-| SRS Edge | OVH Rise-2 2Gbps | **3** | ~€105 | ~€315 |
-| Monitoring | Hetzner AX41-NVMe | 1 | €42.30 | €42.30 |
-| Redis HA | Hetzner CPX32 | 2 | €13.99 | €27.98 |
-| **Sous-total serveurs** | | | | **~€2 880** |
-| Bunny CDN + Gcore CDN | | — | variable | €300-2 000 |
-| **TOTAL Phase 2** | | | | **~€3 200-4 900** |
-
-**Économie vs ancien design Phase 2 (~€9 708/mois) : −EUR 6 800/mois = −70%.**
+| Role | Modele | Qte | Prix unit. HT | Total/mois |
+|------|--------|-----|--------------|------------|
+| SRS Origin | OVH Rise-1 | **2** (HA) | 48.44 EUR | 96.88 EUR |
+| FFmpeg QSV | Hetzner EX44 (Allemagne) | **50** | 49.00 EUR | 2 450 EUR |
+| SRS Edge | OVH Rise-2 + 2Gbps | **3** | 55.24 + ~100 = ~155 EUR | ~465 EUR |
+| Monitoring | Hetzner AX41-NVMe (Allemagne) | 1 | 44.00 EUR (42.30 + 1.70 IPv4) | 44.00 EUR |
+| Redis HA | Hetzner CPX32 | 2 | 14.49 EUR (13.99 + 0.50 IPv4) | 28.98 EUR |
+| **Sous-total serveurs** | | | | **~3 085 EUR** |
+| Bunny CDN + Gcore CDN | | -- | variable | 300-2 000 EUR |
+| **TOTAL Phase 2** | | | | **~3 385-5 085 EUR** |
 
 ---
 
@@ -1297,20 +1364,22 @@ done
 Bande passante Edge : 36 streams ?? 6.3 Mbps = 227 Mbps → 1 Rise-2 1 Gbps suffit
 ```
 
-| Poste | Machine | Qte | Specs | Prix/mois |
-|-------|---------|-----|-------|-----------|
-| HAProxy + SRS Origin + Orchestrateur | **OVH Rise-1** | **1** | Xeon-E 2336 · 32 GB · 1 Gbps | **€65** |
-| FFmpeg QSV | **Hetzner EX44** | **3** | i5-13500 · QSV UHD 770 · 64 GB | **€142** |
-| SRS Edge | **OVH Rise-2** | **1** | Xeon-E 2388G · 64 GB · **1 Gbps standard** · (pas besoin 2Gbps encore) | **€73** |
-| Redis | Hetzner CPX11 | 1 | 2 vCPU · 2 GB | **€3.79** |
-| Monitoring (optionnel Phase 1A) | Hetzner CX22 | 1 | Prometheus + Grafana léger | **€5** |
-| Cloudflare | Geo DNS | — | 1 pool origin | **€5** |
-| **TOTAL SERVEURS** | | | | **~€294/mois** |
-| Bunny CDN EU/USA | Variable | | $0.010/GB | **€20-150** |
-| Gcore CDN Afrique/Asie | Variable | | €0.020/GB | **€20-80** |
-| **TOTAL Phase 1A** | | | | **~€334-524/mois** |
+| Poste | Machine | Qte | Prix unitaire HT | Total/mois | Setup (une fois) |
+|-------|---------|-----|-----------------|------------|------------------|
+| HAProxy + SRS Origin + Orchestrateur | **OVH Rise-1** | **1** | 48.44 EUR | **48.44 EUR** | 56.99 EUR |
+| FFmpeg QSV | **Hetzner EX44** (Allemagne) | **3** | 49.00 EUR (47.30 + 1.70 IPv4) | **147.00 EUR** | 3 x 99 EUR = 297 EUR |
+| Hot Standby EX44 | **Hetzner EX44** (Allemagne) | **1** | 49.00 EUR | **49.00 EUR** | 99 EUR |
+| SRS Edge | **OVH Rise-2** | **1** | 55.24 EUR (1 Gbps standard) | **55.24 EUR** | 64.99 EUR |
+| HAProxy HA (x2) | **Hetzner CX33** | **2** | 6.99 EUR (6.49 + IPv4) | **13.98 EUR** | 0 EUR |
+| Redis | Hetzner CPX11 | 1 | 4.99 EUR (4.49 + 0.50 IPv4) | **4.99 EUR** | 0 EUR |
+| Monitoring | Hetzner CX33 | 1 | 6.99 EUR (6.49 + 0.50 IPv4) | **6.99 EUR** | 0 EUR |
+| Cloudflare | Geo DNS | -- | -- | **~5 EUR** | -- |
+| **TOTAL SERVEURS** | | | | **~330 EUR/mois** | **~518 EUR** (une fois) |
+| Bunny CDN EU/USA | Variable | | $0.010/GB | **20-150 EUR** | -- |
+| Gcore CDN Afrique/Asie | Variable | | 0.020 EUR/GB | **20-80 EUR** | -- |
+| **TOTAL Phase 1A** | | | | **~370-560 EUR/mois** | |
 
-> **Pourquoi 1 Rise-2 sans 2Gbps ?** À 45 lives, la bande passante Edge max est ~250 Mbps (viewers en pic) = largement dans le Gbps standard. Tu passeras à Rise-2 2Gbps au seuil suivant.
+A 45 lives, la bande passante Edge max est ~250 Mbps (viewers en pic), largement en dessous du 1 Gbps standard du Rise-2. L'upgrade vers 2 Gbps (~100 EUR/mois de plus) ne sera necessaire qu'au-dessus de 300 lives.
 
 ---
 
@@ -1318,23 +1387,23 @@ Bande passante Edge : 36 streams ?? 6.3 Mbps = 227 Mbps → 1 Rise-2 1 Gbps suff
 
 > **Principe :** Tu regardes ton dashboard Prometheus (`active_ffmpeg_streams_total`). Dès qu'un seuil approaché à **80%**, tu commandes les ressources du palier suivant. Chaque action est indépendante, tu ajoutes UNIQUEMENT ce qui est listé.
 
-| Seuil lives simultanés | EX44 total | Edge total | Action à faire | Coût serveurs/mois |
-|------------------------|-----------|-----------|----------------|--------------------|
-| **45** *(Phase 1A)* | **3** | **1× Rise-2 1Gbps** | Démarrage | ~€294 |
-| **75** | **5** | 1× Rise-2 1Gbps | +2 EX44 (`add-ex44.sh`) | ~€388 |
-| **120** | **8** | 1× Rise-2 1Gbps | +3 EX44 | ~€530 |
-| **150** | **10** | **2× Rise-2 1Gbps** | +2 EX44 + **1 Rise-2** | ~€673 |
-| **225** | **15** | 2× Rise-2 1Gbps | +5 EX44 | ~€909 |
-| **300** *(Phase 1 MVP)* | **20** | **3× Rise-2 1Gbps** | +5 EX44 + 1 Rise-2 | **~€1 082** |
-| **375** | **25** | 3× Rise-2 **2Gbps** | +5 EX44 + **upgrade Edge → 2Gbps (OVH option)** | ~€1 364 |
-| **500** *(Phase 2)* | **34** | 3× Rise-2 2Gbps | +9 EX44 + **2× SRS Origin** (HA) | **~€1 870** |
-| **750** | **50** | **4× Rise-2 2Gbps** | +16 EX44 + 1 Rise-2 2Gbps | ~€2 755 |
-| **1 000** | **67** | 4× Rise-2 2Gbps | +17 EX44 | ~€3 450 |
-| **1 500** | **100** | **6× Rise-2 2Gbps** | +33 EX44 + 2 Rise-2 2Gbps | ~€5 050 |
-| **2 000** *(Phase 3)* | **134** | **8× Rise-2 2Gbps** | +34 EX44 + 2 Rise-2 2Gbps | **~€6 650** |
-| **3 000** | **200** | 8× Rise-2 2Gbps | +66 EX44 | ~€9 850 |
-| **5 000** | **334** | **12× Rise-2 2Gbps** | +134 EX44 + 4 Rise-2 2Gbps | ~€16 200 |
-| **∞ infiniment scalable** | **+15/palier** | +1 Rise-2 tous les 150 lives | `add-ex44.sh` loop | €N × 47.30 + €M × 73 |
+| Seuil lives | EX44 total | Edge total | Action a faire | Cout serveurs/mois (HT) |
+|-------------|-----------|-----------|----------------|------------------------|
+| **45** *(Phase 1A)* | **3+1 standby** | **1x Rise-2 1Gbps** | Demarrage | ~330 EUR |
+| **75** | **5+1** | 1x Rise-2 1Gbps | +2 EX44 (`add-ex44.sh`) | ~427 EUR |
+| **120** | **8+1** | 1x Rise-2 1Gbps | +3 EX44 | ~574 EUR |
+| **150** | **10+1** | **2x Rise-2 1Gbps** | +2 EX44 + 1 Rise-2 | ~684 EUR |
+| **225** | **15+1** | 2x Rise-2 1Gbps | +5 EX44 | ~929 EUR |
+| **300** *(Phase 1 MVP)* | **20+1** | **3x Rise-2 1Gbps** | +5 EX44 + 1 Rise-2 | **~1 194 EUR** |
+| **375** | **25+1** | 3x Rise-2 **2Gbps** | +5 EX44 + upgrade Edge 2Gbps (+100 EUR/Edge/mois) | ~1 739 EUR |
+| **500** *(Phase 2)* | **34+1** | 3x Rise-2 2Gbps | +9 EX44 + 2e SRS Origin (HA) | **~2 230 EUR** |
+| **750** | **50+1** | **4x Rise-2 2Gbps** | +16 EX44 + 1 Rise-2 2Gbps | ~3 044 EUR |
+| **1 000** | **67+1** | 4x Rise-2 2Gbps | +17 EX44 | ~3 877 EUR |
+| **1 500** | **100+1** | **6x Rise-2 2Gbps** | +33 EX44 + 2 Rise-2 2Gbps | ~5 800 EUR |
+| **2 000** *(Phase 3)* | **134+1** | **8x Rise-2 2Gbps** | +34 EX44 + 2 Rise-2 2Gbps | **~7 860 EUR** |
+| **3 000** | **200+1** | 8x Rise-2 2Gbps | +66 EX44 | ~11 100 EUR |
+| **5 000** | **334+1** | **12x Rise-2 2Gbps** | +134 EX44 + 4 Rise-2 2Gbps | ~18 200 EUR |
+| **au-dela** | **+15/palier** | +1 Rise-2 tous les 150 lives | `add-ex44.sh` loop | N x 49.00 + M x 155.24 |
 
 **Formule de calcul rapide à tout moment :**
 ```
@@ -1358,18 +1427,18 @@ Upgrade OVH : Control Panel → Serveur → Options réseau → Bande passante g
 
 | Poste | **Phase 1A** | Phase 1 MVP | Phase 2 | Phase 3 |
 |-------|-------------|-------------|---------|--------|
-| Lives simultanés max | **45** | 300 | 750 | 2 000+ |
-| **HAProxy LB (2× CX33 Keepalived)** | **€13** (×2) | **€13** (×2) | **€13** (×2) | **€13** (×2) |
-| SRS Origin (OVH Rise-1) | €65 (×1) | €65 (×1) | €130 (×2 HA) | €130 (×2) |
-| FFmpeg EX44 QSV | **€142** (×3) | **€946** (×20) | **€2 365** (×50) | **€4 162-6 322** (×88-134) |
-| SRS Edge | ~€73 (×1 · 1Gbps) | ~€219 (×3 · 1Gbps) | ~€420 (×4 · 2Gbps) | ~€600 (×8 · 2Gbps) |
-| Monitoring (AX41 ou CX33) | €6.49 | €42.30 | €42.30 | €84.60 |
-| Redis (CPX11 ou CPX22) | €3.79 | €8 | €28 | €28 |
-| Cloudflare | ~€5 | ~€15 | ~€15 | ~€15 |
-| **Sous-total serveurs** | **~€308** | **~€1 308** | **~€3 013** | **~€5 033-7 193** |
-| Bunny CDN EU/USA | ~€20-150 | €200-1 000 | €400-2 000 | €800-5 000 |
-| Gcore CDN Afrique/Asie | ~€20-80 | €100-400 | €200-600 | €300-1 500 |
-| **TOTAL/mois** | **~€348-538** | **~€1 608-2 708** | **~€3 613-5 613** | **~€6 133-13 693** |
+| Lives max | **45** | 300 | 750 | 2 000+ |
+| **HAProxy LB (2x CX33 Keepalived)** | **13.98 EUR** (x2) | **13.98 EUR** (x2) | **13.98 EUR** (x2) | **13.98 EUR** (x2) |
+| SRS Origin (OVH Rise-1) | 48.44 EUR (x1) | 48.44 EUR (x1) | 96.88 EUR (x2 HA) | 96.88 EUR (x2) |
+| FFmpeg EX44 QSV (49 EUR/u) | **196 EUR** (x3+1 standby) | **1 029 EUR** (x20+1) | **2 499 EUR** (x50+1) | **6 615 EUR** (x134+1) |
+| SRS Edge (Rise-2) | 55.24 EUR (x1 1Gbps) | 165.72 EUR (x3 1Gbps) | ~620 EUR (x4 2Gbps) | ~1 242 EUR (x8 2Gbps) |
+| Monitoring | 6.99 EUR (CX33) | 44.00 EUR (AX41) | 44.00 EUR (AX41) | 88.00 EUR (AX41 x2) |
+| Redis | 4.99 EUR (CPX11) | 4.99 EUR (CPX11) | 28.98 EUR (CPX32 x2 HA) | 28.98 EUR (CPX32 x2 HA) |
+| Cloudflare | ~5 EUR | ~15 EUR | ~15 EUR | ~15 EUR |
+| **Sous-total serveurs** | **~330 EUR** | **~1 322 EUR** | **~3 319 EUR** | **~8 101 EUR** |
+| Bunny CDN EU/USA | ~20-150 EUR | 200-1 000 EUR | 400-2 000 EUR | 800-5 000 EUR |
+| Gcore CDN Afrique/Asie | ~20-80 EUR | 100-400 EUR | 200-600 EUR | 300-1 500 EUR |
+| **TOTAL/mois** | **~370-560 EUR** | **~1 622-2 722 EUR** | **~3 919-5 919 EUR** | **~9 201-14 601 EUR** |
 
 ---
 
@@ -2223,7 +2292,7 @@ done
 > **Pourquoi on ne fait PAS d'overflow sur Cloud VM (CCX33) :** Les instances cloud n'ont pas de puce graphique (Intel QSV). Elles transcoderaient via CPU (`libx264`) et s'effondreraient à 3-5 streams maximum avec une qualité instable. Inacceptable en production.
 
 **La vraie solution 100% robuste : un EX44 de secours dédié.**
-Pour seulement **€47.30/mois**, on maintient en permanence **1 serveur EX44 de plus que nécessaire**, configuré et connecté au cluster, mais gardé vide (priorité basse dans l'orchestrateur Redis).
+Pour seulement **49.00 EUR/mois**, on maintient en permanence **1 serveur EX44 de plus que nécessaire**, configuré et connecté au cluster, mais gardé vide (priorité basse dans l'orchestrateur Redis).
 
 * **Capacité immédiate :** 15-20 streams instantanés de marge en cas de pic inattendu.
 * **Le temps tampon :** Ce serveur encaisse l'overflow instantanément pendant que le nouveau EX44 est commandé et provisionné (~10-15 minutes total en Allemagne).
@@ -2597,13 +2666,21 @@ vhost __defaultVhost__ {
 
 ---
 
-*Document version 4.2 — Architecture Production · Intel QSV EX44 · Avril 2026*
-*Prix EX44 Hetzner : €47.30/mois · CX33 : €6.49/mois · OVH Rise-1 : ~€65/mois · OVH Rise-2 : ~€73/mois + option 2 Gbps ~€30-40/mois*
-*Économie réalisée vs ancienne architecture : ~€3 530/mois = ~€42 360/an*
-*Bunny CDN : $0.010/GB EU standard · $0.005/GB volume · $0.060/GB Afrique (→ Gcore à €0.020/GB)*
-*Gcore CDN : PRO €100/mois · 5TB inclus · €0.020/GB overage · 210+ PoPs dont Afrique/Asie*
-*RTMP confirmé pour iOS et Android (HaishinKit Android ne supporte pas SRT en 2026)*
-*HAProxy HA : Keepalived unicast VIP failover < 2s · Rate limit 5 conn/IP*
-*Secrets : .env chiffrés via sops+age (Phase 1A) → HashiCorp Vault (Phase 2+)*
-*IPv6 activé sur tous les serveurs · WAF Cloudflare sur endpoints publics*
-*Orchestrateur Dockerisé (gunicorn 4 workers) · CI/CD avec rollback automatique sur échec*
+*Document version 4.4 -- Architecture Production -- Intel QSV EX44 -- Avril 2026*
+
+*Prix verifies via checkout et configurateur avril 2026 (HT sauf mention) :*
+*Hetzner EX44 Allemagne : 49.00 EUR/mois (47.30 + 1.70 IPv4) -- setup 99 EUR -- TTC : 58.31 EUR/mois*
+*Hetzner EX44 Finlande : 44.00 EUR/mois (42.30 + 1.70 IPv4) -- setup 99 EUR -- TTC : 52.36 EUR/mois*
+*Hetzner AX41-NVMe Allemagne : 44.00 EUR/mois (42.30 + 1.70 IPv4) -- setup 0 EUR (promo)*
+*Hetzner AX41-NVMe Finlande : 38.40 EUR/mois (36.70 + 1.70 IPv4) -- setup 0 EUR (promo)*
+*Hetzner CX33 Cloud : 6.99 EUR/mois (6.49 + 0.50 IPv4) -- pas de setup*
+*Hetzner CPX11 Cloud : 4.99 EUR/mois (4.49 + 0.50 IPv4) -- 2 vCPU AMD, 2 GB RAM*
+*Hetzner CPX32 Cloud : 14.49 EUR/mois (13.99 + 0.50 IPv4) -- 4 vCPU AMD, 8 GB RAM*
+*OVH Rise-1 : 48.44 EUR/mois HT (promo -15%, base 56.99) -- setup inclus 1er mois*
+*OVH Rise-2 : 55.24 EUR/mois HT (promo -15%, base 64.99) -- setup inclus 1er mois*
+*OVH option 2 Gbps public : ~100 EUR HT/mois supplementaire -- vRack 2 Gbps : 10 EUR/mois*
+*Bunny CDN : $0.010/GB EU standard -- $0.005/GB volume -- $0.060/GB Afrique*
+*Gcore CDN : PRO 100 EUR/mois -- 5TB inclus -- 0.020 EUR/GB overage -- 210+ PoPs*
+*Cloudflare : LB 5 USD/mois + Geo Steering 10 USD/mois = ~15 USD/mois*
+*Sources : hetzner.com -- eco.ovhcloud.com -- bunny.net/pricing -- gcore.com/pricing -- cloudflare.com/plans*
+
