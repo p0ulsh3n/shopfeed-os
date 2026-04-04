@@ -76,11 +76,52 @@ class CartShippingResult:
 
 # ── Core calculation functions ───────────────────────────────────
 
+def _resolve_distance_price(
+    rate: dict,
+    distance_km: float,
+    base_price: float,
+) -> float:
+    """Resolve the shipping price using distance-based pricing if available.
+
+    Priority order:
+      1. distance_tiers (Level 3 — most precise)
+      2. price_per_km   (Level 2 — base + $/km)
+      3. flat base_price (Level 1 — default, no distance adjustment)
+
+    Args:
+        rate: The vendor's zone rate config dict.
+        distance_km: Exact distance between vendor and buyer.
+        base_price: Flat base price from weight tiers.
+
+    Returns:
+        Adjusted shipping price (float).
+    """
+    # Level 3: Explicit distance sub-tiers
+    distance_tiers = rate.get("distance_tiers", [])
+    if distance_tiers:
+        # Sort tiers by max_km ascending (safety)
+        sorted_tiers = sorted(distance_tiers, key=lambda t: t.get("max_km", 0))
+        for tier in sorted_tiers:
+            if distance_km <= tier.get("max_km", 99999):
+                return tier.get("price", base_price)
+        # Beyond all tiers → use the last (highest) tier price
+        return sorted_tiers[-1].get("price", base_price)
+
+    # Level 2: Base + price per km
+    price_per_km = rate.get("price_per_km")
+    if price_per_km is not None and price_per_km > 0:
+        return base_price + (distance_km * price_per_km)
+
+    # Level 1: Flat rate (no distance adjustment)
+    return base_price
+
+
 def calculate_vendor_shipping(
     items: list[dict],
     zone: str,
     vendor_shipping_config: dict | None = None,
     package_weight_g: int = 100,
+    distance_km: float = 0.0,
 ) -> VendorShippingResult:
     """Calculate shipping cost for a single vendor's items in a given zone.
 
@@ -94,6 +135,8 @@ def calculate_vendor_shipping(
             base_price, base_weight_g, price_per_extra_kg, free_above).
             REQUIRED — no defaults. If None, shipping is unavailable.
         package_weight_g: Additional packaging weight (grams)
+        distance_km: Exact distance between vendor and buyer (from geosort).
+            Used for distance-based pricing if vendor configured it.
 
     Returns:
         VendorShippingResult with calculated cost
@@ -146,11 +189,15 @@ def calculate_vendor_shipping(
     else:
         # Base price covers up to base_weight_g
         if total_weight_g <= base_weight_g:
-            shipping_cost = base_price
+            weight_price = base_price
         else:
             # Extra weight charged per kg
             extra_weight_kg = (total_weight_g - base_weight_g) / 1000.0
-            shipping_cost = base_price + (extra_weight_kg * price_per_extra_kg)
+            weight_price = base_price + (extra_weight_kg * price_per_extra_kg)
+
+        # Apply distance-based pricing (overrides base_price if configured)
+        # This uses the 3-level priority: distance_tiers > price_per_km > flat
+        shipping_cost = _resolve_distance_price(rate, distance_km, weight_price)
 
 
     return VendorShippingResult(
@@ -249,12 +296,13 @@ def calculate_cart_shipping(
         # Calculate package weight
         package_weight_g = vendor_config.get("package_weight_g", 100)
 
-        # Calculate shipping
+        # Calculate shipping (pass distance for distance-based pricing)
         result = calculate_vendor_shipping(
             items=items,
             zone=zone,
             vendor_shipping_config=zone_rate,
             package_weight_g=package_weight_g,
+            distance_km=distance_km,
         )
         result.vendor_id = vendor_id
         result.distance_km = distance_km

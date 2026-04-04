@@ -83,6 +83,22 @@ class ShippingRateTier(BaseModel):
     price_per_extra_kg: float = 0.0     # Price per additional kg above max_weight_g
 
 
+class DistanceTier(BaseModel):
+    """Optional distance-based sub-tier within a zone.
+
+    Allows vendors to vary their shipping price by distance
+    within the same zone (especially useful for Zone B — national).
+
+    Example for Zone B (national shipping):
+        DistanceTier(max_km=100, price=2000)   # 0-100 km → 2000 FCFA
+        DistanceTier(max_km=300, price=3000)   # 100-300 km → 3000 FCFA
+        DistanceTier(max_km=600, price=4500)   # 300-600 km → 4500 FCFA
+        DistanceTier(max_km=99999, price=6000) # 600+ km → 6000 FCFA
+    """
+    max_km: float                       # Upper distance bound (km)
+    price: float                        # Shipping price for this distance range
+
+
 class ShippingZoneRate(BaseModel):
     """Vendor-defined rate for one geographic zone (A, B, or C).
 
@@ -90,7 +106,26 @@ class ShippingZoneRate(BaseModel):
     Zone B = same country, different city (Expedition nationale)
     Zone C = different country (Expedition internationale)
 
-    Vendors configure these in their dashboard.
+    Vendors have 3 levels of granularity (from simplest to most precise):
+
+    LEVEL 1 — Flat rate (default, what most vendors use):
+        {"zone": "B", "tiers": [{"base_price": 3000}]}
+        → Everyone in Zone B pays 3000 FCFA.
+
+    LEVEL 2 — Base + per-km (simple graduated pricing):
+        {"zone": "B", "tiers": [{"base_price": 1500}], "price_per_km": 5}
+        → 1500 FCFA + 5 FCFA/km. Buyer at 300km = 1500 + 1500 = 3000 FCFA.
+
+    LEVEL 3 — Distance sub-tiers (most precise):
+        {"zone": "B", "tiers": [{"base_price": 2000}], "distance_tiers": [
+            {"max_km": 100, "price": 2000},
+            {"max_km": 300, "price": 3000},
+            {"max_km": 600, "price": 4500},
+            {"max_km": 99999, "price": 6000}
+        ]}
+        → Price depends on exact distance bucket.
+
+    Priority: distance_tiers > price_per_km > flat base_price.
     """
     zone: str                           # "A", "B", or "C"
     tiers: list[ShippingRateTier] = Field(
@@ -98,6 +133,12 @@ class ShippingZoneRate(BaseModel):
     )
     free_above: float | None = None     # Free shipping if order > this amount
     enabled: bool = True                # Does vendor ship to this zone?
+
+    # ── Distance-based pricing (optional, overrides flat base_price) ──
+    price_per_km: float | None = None   # Level 2: simple graduated (base + $/km)
+    distance_tiers: list[DistanceTier] = Field(
+        default_factory=list,            # Level 3: explicit distance brackets
+    )
 
 
 class ShippingConfig(BaseModel):

@@ -1,409 +1,451 @@
 # Guide RunPod & Coûts Entraînement Pré-Production — ShopFeed OS (Avril 2026)
 
-> [!NOTE]
-> Ce document couvre deux sujets essentiels avant la mise en production :
-> 1. **Guide RunPod** : Comprendre l'interface, les options et quoi choisir
-> 2. **Coûts d'entraînement initial** : Entraîner tous les modèles from scratch + fine-tuner Llama 4 Scout
+> [!CAUTION]
+> Ce document a été refait après un audit complet du code source.
+> Le projet contient **16 datasets** dans `ml/datasets/configs.py` totalisant
+> **350M+ d'interactions + 11M+ d'images + 1M+ de recettes**.
+> Les estimations précédentes sous-estimaient massivement l'ampleur des données.
 
 ---
 
-## PARTIE 1 — Comprendre RunPod : Serverless vs Pods vs Clusters
+## PARTIE 1 — Comprendre RunPod : Que Choisir ?
 
-### Vue d'ensemble des produits RunPod
-
-Quand tu te connectes à RunPod, tu vois ce menu dans la sidebar :
+### Menu RunPod (Sidebar)
 
 ```
 The Hub
-  ├─ Serverless repos     ← Déploiement sans serveur
+  ├─ Serverless repos     ← Déploiement code sans serveur
   ├─ Pod templates        ← Sauvegarder ta config Docker
-  └─ Public endpoints     ← API publique (Whisper, etc.)
+  └─ Public endpoints     ← APIs publiques (Whisper, LLMs...)
 
 Resources
-  ├─ Serverless           ← Exécution à la demande
-  ├─ Pods                 ← Serveurs GPU loués ✅ (ce qu'il te faut)
-  ├─ Clusters             ← Multi-GPU haute performance
-  ├─ Storage              ← Stockage persistant ✅
-  ├─ Fine tuning          ← Interface fine-tuning guidée
-  └─ My templates         ← Tes templates Docker sauvegardés
+  ├─ Serverless           ← Exécution à la demande (cold start)
+  ├─ Pods                 ← Serveurs GPU loués 24/7 ✅ TON CHOIX
+  ├─ Clusters             ← Multi-GPU NVLink interconnectés
+  ├─ Storage              ← Volumes réseau persistants ✅ ESSENTIEL
+  ├─ Fine tuning          ← UI de fine-tuning guidé
+  └─ My templates         ← Tes Docker templates sauvegardés
 ```
-
----
 
 ### ❌ Serverless — PAS pour ShopFeed
+- Démarrage à froid **10-60 secondes** → Feed doit répondre en **< 10ms**
+- Triton, vLLM, FAISS doivent tourner **en permanence** en mémoire
+- Aucun maintien d'état entre les requêtes
 
-> **C'est quoi** : Tu envoies une requête → RunPod démarre un GPU → exécute → s'arrête automatiquement.
-> Tu paies **à la requête**, par seconde d'exécution.
+### ✅ Pods — C'EST CE QU'IL TE FAUT
+- Serveur Linux dédié avec GPU attaché, accès SSH complet
+- Tourne **24h/7j** tant que tu décides
+- Plans : On-Demand / 3 mois / **6 mois** ← ton choix / 1 an / Spot
 
-**Problèmes pour ShopFeed :**
-- Le démarrage à froid prend **10 à 60 secondes** → ton feed doit répondre en **< 10ms** → totalement incompatible
-- Triton Inference Server, vLLM, Ray, Redis, FAISS doivent tourner **en permanence** en mémoire
-- Impossible de maintenir un index FAISS chargé entre deux requêtes
-- Imprévisible pour des SLA de production
-
----
-
-### ✅ Pods — CE QU'IL TE FAUT (tu es au bon endroit)
-
-> **C'est quoi** : Tu loues un serveur Linux avec un ou plusieurs GPU attachés.
-> Il tourne **24h/7j** tant que tu le décides. Tu as un accès SSH complet.
-> C'est exactement comme louer un serveur dédié mais avec GPU.
-
-**Pour ShopFeed :**
-- **Nœud #1** : Pod A100 SXM → tu y installes Triton Inference Server + FAISS
-- **Nœud #2** : Pod H200 SXM → tu y installes vLLM (Scout FP8) + Ray + faster-whisper + VideoMAE
-
-**Types de plans disponibles dans un Pod :**
-
-| Plan | Prix | Interruptible ? | Pour qui ? |
+| Plan | A100 SXM | H200 SXM | Interruptible ? |
 | :--- | :--- | :--- | :--- |
-| **On-Demand** | $1.49/hr (A100) | Non — garanti 24/7 | Production |
-| **3 months savings** | $1.30/hr (A100) | Non — garanti | Production moyen terme |
-| **6 months savings** | **$1.27/hr (A100)** | Non — garanti | ✅ **Notre choix lancement** |
-| **1 year savings** | $1.22/hr (A100) | Non — garanti | Long terme |
-| **Spot** | $0.95/hr (A100) | ⚠️ Oui — peut être interrompu | Training / batch |
-
----
+| On-Demand | $1.49/hr | $3.59/hr | Non |
+| 3 months savings | $1.30/hr | $3.37/hr | Non |
+| **6 months savings** | **$1.27/hr** | **$3.12/hr** | **Non ✅** |
+| 1 year savings | $1.22/hr | Contact sales | Non |
+| **Spot** | **$0.95/hr** | **$2.29/hr** | **Oui ⚠️** |
 
 ### ❌ Clusters — PAS pour ShopFeed maintenant
+- Conçu pour entraîner des LLMs from scratch sur 100+ GPUs
+- Tes modèles de ranking sont < 100M params → 1 GPU suffit largement
 
-> **C'est quoi** : Plusieurs GPU dans le même datacenter, connectés en NVLink/InfiniBand.
-> Conçu pour entraîner des LLMs from scratch sur des milliers de GPUs.
-
-**Pourquoi pas pour toi :**
-- Ton Monolith Training est léger (modèles de ranking < 100M params) → 1 seul GPU suffit
-- Le fine-tuning de Scout se fait avec LoRA sur 1 à 4 GPUs → pas besoin d'un cluster
-- Coût beaucoup plus élevé, complexité inutile
-
----
-
-### Explication de l'écran "Configure Deployment" (ton image)
-
-Quand tu crées un Pod, tu vois 3 champs importants :
+### Écran "Configure Deployment" — Explication
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  Pod name : rich_blue_mongoose                        │
-│  → C'est juste le NOM de ton serveur.                 │
-│    RunPod en génère un aléatoire (tu peux le changer) │
-│    Exemples : "shopfeed-inference-node" ,             │
-│               "shopfeed-ai-node"                      │
-└──────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────┐
-│  Pod template : Runpod Pytorch 2.4.0                  │
-│  runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-...    │
-│                                                       │
-│  → C'est l'IMAGE DOCKER pré-installée sur ton serveur │
-│    Ce template = Ubuntu 22.04 + CUDA 12.4.1 +        │
-│                  Python 3.11 + PyTorch 2.4.0          │
-│    Tout ça est déjà installé quand le Pod démarre.    │
-│                                                       │
-│  ✅ C'est LE BON template pour les 2 nœuds.          │
-│    Tu n'auras qu'à installer vLLM, Triton, Ray,       │
-│    faster-whisper etc. par-dessus via pip/conda.      │
-└──────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────┐
-│  GPU count : 1  2  3  4  5  6  7                     │
-│                                                       │
-│  → Combien de GPUs tu veux sur ce Pod.               │
-│                                                       │
-│  ✅ Nœud #1 (A100) : choisir 1                       │
-│  ✅ Nœud #2 (H200) : choisir 1                       │
-│    (Scout FP8 tient sur 1 seul H200 141GB)           │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  Pod name : rich_blue_mongoose                              │
+│  → Nom du serveur. Renomme en "shopfeed-inference-node"     │
+│    ou "shopfeed-ai-node"                                    │
+├────────────────────────────────────────────────────────────┤
+│  Pod template : Runpod Pytorch 2.4.0 ✅                     │
+│  runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04  │
+│  → Image Docker avec Ubuntu + CUDA 12.4 + Python 3.11 +    │
+│    PyTorch 2.4.0 pré-installés. C'EST LE BON pour les      │
+│    2 nœuds. Tu installeras vLLM/Triton/Ray par-dessus.     │
+├────────────────────────────────────────────────────────────┤
+│  GPU count : [1] 2 3 4 5 6 7                               │
+│  → Choisis 1 pour chaque Pod.                              │
+│    1× A100 pour le Nœud #1 (Triton)                        │
+│    1× H200 pour le Nœud #2 (Scout + Média)                 │
+└────────────────────────────────────────────────────────────┘
 ```
 
-> [!TIP]
-> **Quel template choisir pour chaque nœud ?**
->
-> - **Nœud #1 (A100 — Triton)** : Garde `Runpod Pytorch 2.4.0`. Tu installeras Triton Inference Server par-dessus : `pip install tritonclient[all]` et tu lanceras le serveur Triton via Docker in Docker.
-> - **Nœud #2 (H200 — Scout)** : Garde `Runpod Pytorch 2.4.0`. Tu installeras vLLM par-dessus : `pip install vllm`. C'est la configuration recommandée par l'équipe vLLM.
->
-> Ne choisis PAS le template "Stable Diffusion" ou "Text Generation WebUI" — ceux-là sont pour des usages différents.
-
----
-
-### Network Volume — Le stockage partagé entre tes 2 Pods
-
-Dans l'image, tu vois le filtre **"Network volume"** activé. Voici pourquoi c'est crucial :
+### Network Volume — Stockage Partagé Entre Tes 2 Pods
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Network Volume (Volume Réseau)                              │
-│                                                             │
-│  ✅ Stockage persistant monté dans /workspace               │
-│  ✅ N'est PAS supprimé quand le Pod s'arrête                │
-│  ✅ Peut être monté sur plusieurs Pods simultanément        │
-│  ✅ $0.07/GB/mois (sous 1 TB)                               │
-│                                                             │
-│  Pour ShopFeed, stocker sur le Network Volume :             │
-│  ├─ Llama 4 Scout FP8 (~110 GB) ← ne pas re-télécharger   │
-│  ├─ Index FAISS (~5-10 GB)                                  │
-│  ├─ Checkpoints Monolith (~2-5 GB)                         │
-│  └─ Datasets d'entraînement (~10-50 GB)                    │
-│                                                             │
-│  Taille recommandée : 150-200 GB → ~$10.50-14/mois         │
-└─────────────────────────────────────────────────────────────┘
+Propriétés :
+  ✅ Monté dans /workspace
+  ✅ Persistant (ne s'efface PAS quand le Pod s'arrête)
+  ✅ Partageable entre plusieurs Pods du même datacenter
+  ✅ $0.07/GB/mois (< 1 TB)  |  $0.05/GB/mois (> 1 TB)
+
+Stocker sur le Network Volume :
+  ├─ Llama 4 Scout FP8 quantifié         (~110 GB)
+  ├─ Tous les checkpoints modèles        (~5-10 GB)
+  ├─ Index FAISS                          (~5-10 GB)
+  ├─ Datasets d'entraînement (Parquet)    (~50-100 GB)
+  └─ Datasets images (DeepFashion etc.)   (~200-500 GB)
 ```
 
 > [!IMPORTANT]
-> **Toujours créer le Network Volume AVANT les Pods**, dans le même datacenter (ex: EU-RO-1).
-> Ensuite, lors de la création de chaque Pod, sélectionner ce volume.
-> Les 2 Pods pourront accéder aux mêmes fichiers sans re-télécharger Scout à chaque redémarrage.
+> **Créer le Network Volume AVANT les Pods**, dans le même datacenter.
+> Taille recommandée : **500 GB** → ~$35/mois.
+> Puis attacher ce volume aux 2 Pods lors de leur création.
 
 ---
 
-### Résumé : Quoi choisir sur RunPod
+## PARTIE 2 — Inventaire COMPLET des Datasets du Projet
 
-| Élément | Choix | Raison |
-| :--- | :--- | :--- |
-| **Type de ressource** | **Pods** | Serveurs 24/7 avec contrôle total |
-| **Nœud #1** | A100 SXM 80GB — 6-month plan | $1.27/hr → Triton Inference |
-| **Nœud #2** | H200 SXM 141GB — 6-month plan | $3.12/hr → Scout FP8 + Média |
-| **Storage** | Network Volume ~150-200 GB | $10.50-14/mois → partagé entre Pods |
-| **Template** | Runpod Pytorch 2.4.0 | ✅ Pour les 2 Pods |
-| **GPU count** | 1 | Un seul GPU par Pod |
-| **Plan pricing** | 6 months savings | On-demand interruptible pour le training |
-| **Serverless** | ❌ Non | Démarrage trop lent, pas adapté |
-| **Clusters** | ❌ Non | Inutile à ce stade |
+> Source : `ml/datasets/configs.py` — 16 datasets référencés
 
----
+### Section 32 — Datasets E-Commerce Généraux
 
-## PARTIE 2 — Entraînement Pré-Production sur RunPod
-
-> [!NOTE]
-> Avant de lancer l'application, tu dois :
-> 1. **Entraîner tous les modèles de ranking** from scratch sur tes données
-> 2. **Fine-tuner Llama 4 Scout** sur les données spécifiques à ShopFeed (produits africains, descriptions vendeurs, etc.)
->
-> **Stratégie coût** : Utiliser des **instances Spot** (interruptibles) pour tout l'entraînement.
-> Le prix Spot A100 SXM = **$0.95/hr** (vs $1.49/hr on-demand → -36%).
-> Pour le fine-tuning Scout qui prend plus longtemps, utiliser des Spots avec checkpointing.
-
----
-
-### Phase 1 — Entraînement des Modèles de Ranking (From Scratch)
-
-Ces modèles sont **légers** et s'entraînent rapidement sur un seul A100.
-
-#### Dataset hypothétique de référence
-> Pour les estimations, on suppose ~**1-5M d'interactions** (lignes de logs comportementaux)
-> à l'ouverture bêta, ce qui est réaliste pour un lancement Afrique francophone.
-
-| Modèle | Description | GPU requis | Temps estimé | |
+| # | Dataset | Source | Taille | Utilisation dans ShopFeed |
 | :--- | :--- | :--- | :--- | :--- |
-| **Two-Tower** | Retrieval utilisateur-item (256D) | 1× A100 Spot | ~2-4h | |
-| **DeepFM** | Pre-ranking FM + DNN | 1× A100 Spot | ~1-2h | |
-| **MTL / PLE** | Ranking final multi-tâches (7 objectifs) | 1× A100 Spot | ~3-6h | |
-| **DIN** | Attention séquentielle historique | 1× A100 Spot | ~2-4h | |
-| **DIEN** | Évolution d'intérêt GRU | 1× A100 Spot | ~3-5h | |
-| **BST** | Transformer séquentiel | 1× A100 Spot | ~2-4h | |
-| **SIM** | Historique long (SDIM) | 1× A100 Spot | ~3-6h | |
-| **Ad Ranker EPSILON** | MTL/PLE publicitaire (pCTR/pCVR/pROAS) | 1× A100 Spot | ~2-4h | |
-| **Uplift T-Learner** | Modèle causal T-Learner LightGBM | 1× A100 Spot | ~0.5-1h | |
-| **LightGBM Fraude** | Détection fraude (35 features) | 1× A100 Spot | ~0.5-1h | |
-| **GeoClassifier** | MLP classification géographique | 1× A100 Spot | ~0.5h | |
-| **FAISS Index Build** | Construction index ANN (Two-Tower) | 1× A100 Spot | ~0.5-1h | |
+| 1 | **Alibaba UserBehavior** | HuggingFace | **100M+ behaviors**, 987K users, 4.1M items | Pré-entraînement DIN/DIEN/BST (séquences comportementales) |
+| 2 | **Amazon Reviews 2023** | HuggingFace | **233M+ reviews**, 43M users, 9.9M items | Embeddings texte NLP, matrice user-item pour CF |
+| 3 | **RetailRocket** | Kaggle | **2.7M events**, 1.4M visitors, 417K items | Entraînement comportemental DIEN (view/cart/transaction) |
 
-**Coût Phase 1 :**
+### Section 35 — Datasets Mode (Fashion)
+
+| # | Dataset | Source | Taille | Utilisation dans ShopFeed |
+| :--- | :--- | :--- | :--- | :--- |
+| 4 | **DeepFashion** | HuggingFace | **800K+ images**, 50 catégories, 1000 attributs | Pré-entraînement CLIP fashion + classifieur catégories |
+| 5 | **DeepFashion2** | HuggingFace | **491K images**, 13 catégories, 801K items annotés | Segmentation vêtements, auto-tag produits |
+| 6 | **Marqo-FashionSigLIP** | HuggingFace | Modèle ViT-B-16-SigLIP | BASE pour embeddings visuels mode (+22% recall) |
+| 7 | **FashionCLIP 2.0** | HuggingFace | ViT-B/32, 800K+ produits Farfetch | Backup embedding si SigLIP indisponible |
+| 8 | **iMaterialist** | Kaggle | **1M+ images**, 228 attributs, 8 groupes | Classifieur attributs fins (matière, couleur, motif, style) |
+| 9 | **Fashionpedia** | Kaggle | **48K images**, 27 catégories, 294 attributs | Segmentation pixel-level pour virtual try-on |
+| 10 | **Polyvore Outfits** | GitHub | **21K outfits**, 365K items | Cross-sell "Complete the Look" |
+| 11 | **Fashion IQ** | GitHub | **77K triplets** NL feedback | Recherche conversationnelle ("pareil mais plus long et bleu") |
+| 12 | **Fashion200K** | GitHub | **200K+ images**, 9 classes | Retrieval visuel par attributs |
+
+### Section 35 — Datasets Food & Wellness
+
+| # | Dataset | Source | Taille | Utilisation dans ShopFeed |
+| :--- | :--- | :--- | :--- | :--- |
+| 13 | **Food-101** | HuggingFace | **101K images**, 101 catégories | Auto-classification food dans vidéos/photos vendeurs |
+| 14 | **Recipe1M+** | MIT CSAIL | **1M+ recettes, 13M images** | Enrichissement descriptions produits alimentaires |
+| 15 | **VIREO Food-172** | CityU HK | **110K images**, 172 catégories, 353 ingrédients | Spécialisation cuisine asiatique/africaine |
+| 16 | **PlantNet** | HuggingFace | **8M+ images**, 300K espèces | Auto-identification plantes médicinales |
+
+### Volumétrie Totale
 
 ```
-Temps total estimé (séquentiel) : ~21-38h
-GPU utilisé : A100 SXM Spot → $0.95/hr
+INTERACTIONS COMPORTEMENTALES :
+  Alibaba UserBehavior    : 100,000,000+ interactions
+  Amazon Reviews 2023     : 233,000,000+ reviews
+  RetailRocket            :   2,700,000  events
+  ─────────────────────────────────────────────────
+  TOTAL INTERACTIONS      : ~335,700,000
 
-Optimisation : entraîner en PARALLÈLE (2 modèles simultanés
-               sur le même Pod si VRAM le permet, ou 2 Pods Spot)
+IMAGES :
+  DeepFashion             :    800,000+
+  DeepFashion2            :    491,000
+  iMaterialist            :  1,000,000+
+  Fashionpedia            :     48,000
+  Fashion200K             :    200,000+
+  Food-101                :    101,000
+  Recipe1M+ images        : 13,000,000
+  VIREO Food-172          :    110,000
+  PlantNet                :  8,000,000+
+  ─────────────────────────────────────────────────
+  TOTAL IMAGES            : ~23,750,000
 
-Scénario conservateur  : 38h × $0.95 = $36.10
-Scénario optimiste     : 21h × $0.95 = $19.95
-Estimation réaliste    : ~25-30h × $0.95 = ~$24-$29
-
-+ Stockage disque Pod  : $0.006/hr × 30h = ~$0.18 (négligeable)
-──────────────────────────────────────────────────────────────
-TOTAL Phase 1          : ~$25 - $40
+TEXTES / TRIPLETS :
+  Polyvore Outfits        :    365,000 items
+  Fashion IQ              :     77,000 triplets
+  Recipe1M+ recettes      :  1,000,000+ recettes
 ```
 
-> [!TIP]
-> **Optimisation clé** : Les modèles DIN, DIEN, BST peuvent s'entraîner sur le **même Pod A100**
-> l'un après l'autre sans interruption. Crée un script Python qui les enchaîne automatiquement
-> et qui s'auto-arrête à la fin → pas de GPU qui tourne à vide.
+> [!WARNING]
+> **La volumétrie est MASSIVE.** Si tu télécharges tout, tu as besoin de :
+> - ~50-80 GB pour les interactions (Parquet compressé)
+> - ~500-1000 GB pour toutes les images (JPEG/PNG non compressé)
+> - ~500 GB total en stockage réseau est un MINIMUM
 >
-> ```python
-> # Script d'entraînement séquentiel (exemple)
-> import subprocess, sys
-> models = ["two_tower", "deepfm", "mtl", "din", "dien", "bst", "sim"]
-> for m in models:
->     subprocess.run([sys.executable, f"train_{m}.py"])
-> print("✅ Tous les modèles entraînés. Arrêt du Pod.")
-> # Le Pod s'auto-stop via l'API RunPod après ce script
-> ```
+> **Stratégie : Ne pas tout télécharger.** Utiliser le **streaming mode**
+> de HuggingFace `datasets` pour traiter les données en flux sans tout stocker.
 
 ---
 
-### Phase 2 — Fine-Tuning de Llama 4 Scout (LoRA / QLoRA)
+## PARTIE 3 — Pipeline d'Entraînement (Tiré du Code Source)
 
-C'est la phase la plus importante et la plus coûteuse. L'objectif est d'adapter Scout
-aux spécificités de ShopFeed : produits africains, descriptions vendeurs, langue française +
-langues locales, scoring de qualité photo adapté au contexte.
+Le pipeline est en 4 phases selon le code dans `scripts/` :
 
-#### Pourquoi LoRA et pas un fine-tuning complet ?
-
-> Fine-tuning complet de 109B params nécessiterait ~420 GB de VRAM (optimizer states + gradients).
-> Impossible même avec 8× H100.
->
-> **LoRA (Low-Rank Adaptation)** : On n'entraîne que ~0.1-1% des paramètres (matrices d'adaptation).
-> Nécessite ~20-40 GB de VRAM pour Scout en 4-bit (QLoRA). **Faisable sur 1× A100 ou 1× H100.**
-
-#### Données à préparer pour le fine-tuning
-
-| Dataset | Contenu | Taille estimée |
-| :--- | :--- | :--- |
-| **Quality Scoring** | Paires (image, score_qualité, justification) | ~10K-50K exemples |
-| **Product Enrichment** | (titre_brut → titre_optimisé, description_complète) | ~20K-100K produits |
-| **Ad Copywriting** | (infos_produit → texte_pub_performant) | ~5K-20K exemples |
-| **Content Moderation** | (image+texte → verdict+justification) | ~5K-20K exemples |
-| **Conversational Search** | (requête_utilisateur → query_structurée) | ~10K-50K exemples |
-| **Seller Insights** | (données_vente → conseil_vendeur) | ~5K-10K exemples |
-
-#### Configuration technique recommandée
-
-```python
-# Configuration QLoRA optimale pour Scout 17B MoE sur A100 80GB
-# Via Unsloth (2x plus rapide que HuggingFace seul)
-
-from unsloth import FastLanguageModel
-
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-    max_seq_length = 2048,
-    dtype = None,       # Auto-détecte BF16
-    load_in_4bit = True # QLoRA → ~60GB VRAM
-)
-
-# LoRA config : r=16 adapte le ratio qualité/temps
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16,
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"],
-    lora_alpha = 16,
-    lora_dropout = 0,
-    bias = "none",
-)
+```
+Phase 1a : pretrain.py → Two-Tower sur Alibaba (100M interactions)
+Phase 1b : (à implémenter) → CLIP fashion sur DeepFashion2 + iMaterialist
+Phase 1c : pretrain.py → DIN/DIEN/BST sur Alibaba (séquences temporelles)
+Phase 2  : train.py    → DeepFM, MTL/PLE, SIM, Ad Ranker, Fraude, Geo
+Phase 3  : finetune.py → LoRA fine-tuning sur données propriétaires ShopFeed
+Phase 4  : export_triton.py → Export ONNX + TensorRT + FAISS
 ```
 
-#### Estimation du temps de fine-tuning
+---
 
-| Scénario | GPU | Dataset | Epochs | Temps | Coût |
+### Phase 1a — Pré-entraînement Two-Tower (100M+ interactions)
+
+> Source : `scripts/pretrain.py` → `pretrain_two_tower()`
+
+| | Détails |
+| :--- | :--- |
+| **Dataset** | Alibaba UserBehavior (100M+ behaviors HuggingFace streaming) |
+| **Modèle** | Two-Tower (user_dim=764, item_dim=1348, embedding=256) |
+| **Tâche** | Contrastive learning, in-batch negatives |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Batch size** | 2048 (configurable dans `TrainConfig`) |
+| **Epochs** | 5-10 (config par défaut : 20, mais 5 suffit pour le pré-entraînement) |
+| **Temps estimé** | ~8-15h (100M interactions × 5 epochs, batch 2048, AMP FP16) |
+| **Coût** | **~$8 - $14** |
+
+---
+
+### Phase 1c — Pré-entraînement DIN/DIEN/BST (séquences, 100M+)
+
+> Source : `scripts/pretrain.py` → `pretrain_behavior_models()`
+
+Les 3 modèles sont entraînés **séquentiellement** sur le même Pod.
+
+| Modèle | Params | Particularité | Temps estimé |
+| :--- | :--- | :--- | :--- |
+| **DIN** | ~25M | Attention sur historique court | ~6-10h |
+| **DIEN** | ~30M | GRU évolution d'intérêt + aux loss | ~8-12h |
+| **BST** | ~25M | Transformer séquentiel multi-head | ~6-10h |
+| **TOTAL Phase 1c** | | 3 modèles séquentiels | **~20-32h** |
+
+| | Détails |
+| :--- | :--- |
+| **Dataset** | Alibaba UserBehavior → BehaviorSequenceDataset (max_seq_len=200) |
+| **Taille processée** | 100M interactions → ~60-80M séquences d'entraînement |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Coût** | **~$19 - $30** |
+
+---
+
+### Phase 1b — Embeddings Vision : CLIP/SigLIP + Classifieurs (Images)
+
+> **Pas codé dans `pretrain.py` mais référencé dans les configs.**
+> Il s'agit de fine-tuner les modèles visuels sur les datasets mode/food.
+
+#### a) Fashion SigLIP / CLIP fine-tuning
+
+| | Détails |
+| :--- | :--- |
+| **Modèle base** | Marqo-FashionSigLIP (ViT-B-16-SigLIP, pré-entraîné) |
+| **Datasets** | DeepFashion (800K) + DeepFashion2 (491K) + iMaterialist (1M+) |
+| **Tâche** | Contrastive image-text learning adapté aux produits africains |
+| **Total images** | ~2.3M images fashion |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Temps estimé** | ~15-25h (2.3M images × 3 epochs, batch 256, ViT-B FP16) |
+| **Coût** | **~$14 - $24** |
+
+#### b) Classifieur Food (Food-101 + VIREO)
+
+| | Détails |
+| :--- | :--- |
+| **Modèle** | ViT-Base ou ResNet fine-tuné sur CLIP |
+| **Datasets** | Food-101 (101K) + VIREO Food-172 (110K) |
+| **Total images** | ~211K images |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Temps estimé** | ~2-4h |
+| **Coût** | **~$2 - $4** |
+
+#### c) Classifieur PlantNet (optionnel — si catégorie wellness)
+
+| | Détails |
+| :--- | :--- |
+| **Dataset** | PlantNet (8M+ images, streaming) |
+| **Tâche** | Classification top-500 espèces médicinales |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Temps estimé** | ~10-20h (sous-échantillon 500K-1M images, 3 epochs) |
+| **Coût** | **~$10 - $19** |
+
+#### d) Fashion IQ / Polyvore (recherche conversationnelle + cross-sell)
+
+| | Détails |
+| :--- | :--- |
+| **Datasets** | Fashion IQ (77K triplets) + Polyvore (365K items, 21K outfits) |
+| **Tâche** | Fine-tuner CLIP pour retrieval compositionnel NL |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Temps estimé** | ~3-5h |
+| **Coût** | **~$3 - $5** |
+
+---
+
+### Phase 2 — Entraînement des Autres Modèles (From Scratch)
+
+> Source : `ml/training/train.py` → classe `Trainer`
+
+| Modèle | Params | Dataset | Epochs | Temps | Coût |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Léger** (quality + enrichissement) | 1× A100 Spot | ~10K exemples | 3 | ~4-6h | ~$4-6 |
-| **Complet** (toutes les tâches) | 1× A100 Spot | ~100K exemples | 3 | ~20-40h | ~$19-38 |
-| **Complet rapide** | 2× A100 Spot | ~100K exemples | 3 | ~10-20h | ~$19-38 |
-| **Complet haute qualité** | 1× H100 Spot | ~100K exemples | 5 | ~15-25h | ~$34-57 |
-
-> Spot A100 SXM = **$0.95/hr** / Spot H100 SXM = **$2.29/hr**
-
-**Notre recommandation : 1× A100 SXM Spot, ~30h, ~$29**
-
-```
-Raisons :
-- Le fine-tuning LoRA n'a pas besoin de plus de 1 GPU (pas de parallelisme tensor nécessaire)
-- $0.95/hr × 30h = $28.50 → budget très raisonnable
-- Avec Unsloth, c'est 2× plus rapide → 15h → $14.25
-- Checkpointing toutes les 500 steps → si le Spot est interrompu, on reprend
-```
+| **DeepFM** | ~20M | Alibaba/Synthetic (features hashées) | 20 | ~4-6h | ~$4-6 |
+| **MTL/PLE** | ~15M | Alibaba (7 tâches multi-labels) | 10 | ~5-8h | ~$5-8 |
+| **SIM** | ~35M | Alibaba (historique long SDIM) | 10 | ~6-10h | ~$6-10 |
+| **Ad Ranker (EPSILON)** | ~20M | Synthetic (pCTR/pCVR/pROAS/pStoreVisit) | 10 | ~3-5h | ~$3-5 |
+| **Uplift T-Learner** | ~3M | Synthetic (traitement/contrôle) | 5 | ~1h | ~$1 |
+| **LightGBM Fraude** | ~2M | Synthetic (35 features fraude) | N/A (GBM) | ~30min | ~$0.50 |
+| **GeoClassifier** | ~3M | Données géo (L1→L4 classification) | 10 | ~30min | ~$0.50 |
+| **FAISS Index Build** | — | Embeddings Two-Tower | — | ~1h | ~$1 |
+| **TOTAL Phase 2** | | | | **~21-32h** | **~$21-32** |
 
 ---
 
-### Phase 3 — Export ONNX & Déploiement Triton (une seule fois)
+### Phase 3 — Fine-Tuning LoRA sur Données Propriétaires ShopFeed
 
-Après entraînement, il faut exporter les modèles PyTorch en ONNX et les déployer sur Triton.
-Votre projet a déjà `ml/serving/export_onnx.py` qui automatise tout cela.
+> Source : `ml/training/finetune.py` + `scripts/finetune_run.py`
+
+#### a) LoRA Fine-tuning des modèles de ranking (DIN/DIEN/BST)
+
+> Utilise la classe `FineTuneTrainer` avec `LoRALinear` (rank=8, alpha=16)
+> Gèle les couches basses → entraîne < 1% des params
+
+| | Détails |
+| :--- | :--- |
+| **Modèles** | DIN, DIEN, BST (séquentiels), Two-Tower, MTL/PLE |
+| **Config** | LoRA rank=8, alpha=16, dropout=0.05, only upper MLP layers |
+| **Données** | Données propriétaires ShopFeed (premières ~10K-50K interactions bêta) |
+| **GPU** | 1× A100 Spot ($0.95/hr) |
+| **Temps estimé** | ~5-10h (5 modèles × 3 epochs × ~10K-50K données) |
+| **Coût** | **~$5 - $10** |
+
+#### b) Fine-tuning Llama 4 Scout (QLoRA)
+
+| | Détails |
+| :--- | :--- |
+| **Modèle** | Llama 4 Scout 17B-16E MoE (109B total) en QLoRA 4-bit |
+| **Tâches** | Quality scoring, enrichissement produit, copywriting pub, modération, recherche conv., insights vendeur, catégorisation |
+| **Données** | ~50K-100K exemples préparés (textes/images produits africains) |
+| **GPU** | 1× A100 Spot ($0.95/hr) — QLoRA charge le modèle en 4-bit (~60GB VRAM, tient sur A100 80GB) |
+| **Libraire** | Unsloth (2× plus rapide) ou HuggingFace PEFT |
+| **Temps estimé** | ~15-40h (100K exemples × 3 epochs, LoRA r=16) |
+| **Coût** | **~$14 - $38** |
+
+---
+
+### Phase 4 — Export, Compilation & Validation
+
+> Source : `scripts/export_triton.py` + `ml/serving/export_onnx.py`
 
 | Tâche | Temps | Coût |
 | :--- | :--- | :--- |
-| Export ONNX des 12 modèles | ~30-60 min | ~$0.80 (A100 Spot) |
-| Compilation TensorRT (Triton) | ~1-2h (première fois) | ~$1.90 (A100 Spot) |
-| Tests de validation inférence | ~1h | ~$0.95 (A100 Spot) |
-| **TOTAL Phase 3** | ~3-4h | **~$2.85 - $3.80** |
+| Export ONNX des 12 modèles ranking | ~30-60 min | ~$0.50-1 |
+| Compilation TensorRT (1ère fois) | ~1-2h | ~$1-2 |
+| Tests de validation inférence | ~1h | ~$1 |
+| Build FAISS index final | ~30 min | ~$0.50 |
+| Test de charge (load testing) | ~2h | ~$2 |
+| **TOTAL Phase 4** | **~5-7h** | **~$5-7** |
 
 ---
 
-### Récapitulatif Coût Total Pré-Production
+## PARTIE 4 — Récapitulatif Coût Total Pré-Production
 
-| Phase | Description | GPU (Spot) | Durée estimée | Coût estimé |
-| :--- | :--- | :--- | :--- | :--- |
-| **Phase 1** | Entraînement 12 modèles de ranking | A100 SXM Spot ($0.95/hr) | ~25-30h | **~$24 - $29** |
-| **Phase 2** | Fine-tuning Scout QLoRA (Unsloth) | A100 SXM Spot ($0.95/hr) | ~15-30h | **~$14 - $29** |
-| **Phase 3** | Export ONNX + Compilation TensorRT | A100 SXM Spot ($0.95/hr) | ~3-4h | **~$3 - $4** |
-| **Stockage** | Network Volume ~200 GB pendant la phase | $0.07/GB/mois | ~1 mois | **~$14** |
-| **Marge erreurs/itérations** | Ré-entraînements, bugs, debug | — | — | **~$30** |
-| | | | | |
-| **TOTAL PRÉ-PRODUCTION** | | | | **~$85 - $106** |
+| Phase | Description | Datasets/Données | GPU | Heures | Coût |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1a** | Pré-train Two-Tower | Alibaba (100M) | A100 Spot | ~8-15h | **$8-14** |
+| **1b-Fashion** | Fine-tune SigLIP/CLIP mode | DeepFashion+iMat (2.3M imgs) | A100 Spot | ~15-25h | **$14-24** |
+| **1b-Food** | Classifieur food | Food-101+VIREO (211K imgs) | A100 Spot | ~2-4h | **$2-4** |
+| **1b-Plant** | Classifieur plantes (optionnel) | PlantNet (sous-ensemble 1M) | A100 Spot | ~10-20h | **$10-19** |
+| **1b-FashionIQ** | Retrieval conversationnel | FashionIQ+Polyvore (442K) | A100 Spot | ~3-5h | **$3-5** |
+| **1c** | Pré-train DIN/DIEN/BST | Alibaba séquences (100M) | A100 Spot | ~20-32h | **$19-30** |
+| **2** | Train ranking + ads + fraude | Alibaba + Synthetic | A100 Spot | ~21-32h | **$21-32** |
+| **3a** | LoRA ranking (propre données) | Bêta ShopFeed (~50K) | A100 Spot | ~5-10h | **$5-10** |
+| **3b** | QLoRA Scout LLM | Données ShopFeed (~100K) | A100 Spot | ~15-40h | **$14-38** |
+| **4** | Export + Build + Tests | — | A100 Spot | ~5-7h | **$5-7** |
+| | | | | | |
+| **TOTAL GPU** | | | | **~104-190h** | **~$101-$183** |
+| **Stockage** | Network Volume ~500 GB pendant 2 mois | | | | **$70** |
+| **Marge (bugs, re-runs, debug)** | ~30% sécurité | | | | **~$50** |
+| | | | | | |
+| **BUDGET TOTAL PRÉ-PRODUCTION** | | | | | **~$220 - $300** |
 
 > [!TIP]
-> **Budget total pré-production recommandé : ~$100-150**
+> **Budget recommandé : ~$300** (avec marge confortable pour les itérations).
 >
-> Avec ce budget :
-> - ✅ Tous les modèles entraînés et validés
-> - ✅ Scout fine-tuné sur tes données (qualité optimale pour le marché africain)
-> - ✅ Triton configuré et testé
-> - ✅ Marge pour les itérations et debugging
->
-> C'est **négligeable** comparé aux $19 280 du budget 6 mois de production.
+> Ce budget couvre :
+> - ✅ 16 datasets dont 100M+ interactions Alibaba + 2.3M images fashion
+> - ✅ 12 modèles de ranking entraînés
+> - ✅ Embeddings visuels CLIP/SigLIP fine-tunés pour la mode africaine
+> - ✅ Classifieurs food + plantes entraînés
+> - ✅ Scout QLoRA fine-tuné sur tes données
+> - ✅ FAISS index construit
+> - ✅ Tout exporté en ONNX + TensorRT
+> - ✅ Validé et testé en charge
 
 ---
 
-### Checklist Pré-Production (Ordre Recommandé)
+## PARTIE 5 — Calendrier Pré-Production Recommandé
 
 ```
-SEMAINE 1 — Préparation
-□ Créer le Network Volume (200 GB) sur RunPod (même datacenter que les futurs Pods)
-□ Préparer et nettoyer les datasets d'entraînement
-□ Préparer les datasets de fine-tuning Scout (quality, enrichissement, copywriting)
+SEMAINE 1 — Préparation ($0)
+├─ □ Créer Network Volume RunPod (500 GB, même datacenter)
+├─ □ Préparer les datasets de fine-tuning Scout (exemples annotés)
+├─ □ Collecter ~50K interactions bêta (ou synthetic fallback)
+└─ □ Valider les scripts d'entraînement localement (CPU, batch réduit)
 
-SEMAINE 2-3 — Entraînement Ranking
-□ Lancer Pod A100 Spot → exécuter le script d'entraînement séquentiel Phase 1
-□ Valider chaque modèle (AUC, NDCG, métriques métier)
-□ Sauvegarder les checkpoints sur le Network Volume
-□ Construire l'index FAISS
+SEMAINE 2 — Pré-entraînement Phase 1 (~$40-68)
+├─ □ Lancer Pod A100 Spot → Phase 1a (Two-Tower, 100M interactions)
+├─ □ → Phase 1c (DIN/DIEN/BST séquentiellement)
+├─ □ Sauvegarder checkpoints sur Network Volume
+└─ □ Script auto-stop Pod via RunPod SDK à la fin
 
-SEMAINE 3-4 — Fine-tuning Scout
-□ Lancer Pod A100 Spot → fine-tuner Scout avec QLoRA / Unsloth
-□ Évaluer sur un dataset de test hold-out
-□ Merger les adaptateurs LoRA dans le modèle de base
-□ Sauvegarder le modèle FP8 fusionné sur le Network Volume
+SEMAINE 3 — Vision + Ranking (~$40-65)
+├─ □ Phase 1b : Fine-tune SigLIP sur DeepFashion+iMaterialist
+├─ □ Phase 1b : Classifieurs Food-101 + VIREO
+├─ □ Phase 2 : DeepFM, MTL/PLE, SIM, Ad Ranker, Fraude, Geo
+└─ □ Valider les métriques (AUC > 0.70, LogLoss < 0.50)
 
-SEMAINE 4 — Préparation Production
-□ Exporter tous les modèles ranking en ONNX
-□ Compiler TensorRT sur le Nœud #1 (A100)
-□ Déployer Scout FP8 sur Nœud #2 (H200) et tester vLLM
-□ Test de charge (load testing) sur les 2 Pods
-□ Monitorer les latences Feed + LLM
+SEMAINE 4 — Fine-tuning + Export (~$24-55)
+├─ □ Phase 3a : LoRA fine-tuning ranking sur données ShopFeed
+├─ □ Phase 3b : QLoRA Scout sur données annotées
+├─ □ Phase 4 : Export ONNX, TensorRT, FAISS
+├─ □ Test de charge (latence < 10ms feed, < 100ms Scout)
+└─ □ Deploy sur les 2 Pods production (A100 + H200)
 
 LANCEMENT 🚀
 ```
 
 ---
 
-### Outils Recommandés
+## PARTIE 6 — Optimisations de Coût
 
-| Outil | Pour quoi | Lien |
-| :--- | :--- | :--- |
-| **Unsloth** | Fine-tuning LoRA 2× plus rapide, moins de VRAM | `pip install unsloth` |
-| **wandb / MLflow** | Suivi des métriques d'entraînement en temps réel | Déjà dans ton projet (`ml/tracking/`) |
-| **vLLM** | Serveur d'inférence Scout FP8 | `pip install vllm` |
-| **faster-whisper** | Transcription audio INT8 (4× Whisper standard) | `pip install faster-whisper` |
-| **RunPod SDK** | Auto-stop le Pod quand l'entraînement finit | `pip install runpod` |
+1. **Spot Instances ($0.95/hr vs $1.49/hr = -36%)** :
+   Tous les entraînements utilisent des Spot. Le checkpointing intégré
+   dans `train.py` (`_save_checkpoint()`) permet de reprendre si interrompu.
 
-```python
-# Auto-stop Pod à la fin du script (évite de payer pour un GPU idle)
-import runpod
-runpod.api_key = "TON_API_KEY"
+2. **HuggingFace Streaming Mode** :
+   Les gros datasets (Alibaba 100M, Amazon 233M, PlantNet 8M) sont chargés
+   en **streaming** (`streaming=True` dans `loaders.py`) → pas besoin de tout
+   télécharger sur le disque. Économie de ~500 GB de stockage.
 
-# À la fin du script d'entraînement :
-runpod.stop_pod(runpod.get_current_pod_id())
-print("✅ Entraînement terminé. Pod arrêté automatiquement.")
-```
+3. **Mixed Precision (AMP FP16)** :
+   Activé par défaut dans `Trainer.__init__()` → `mixed_precision=True`.
+   Réduit le temps d'entraînement de ~40-50% et la VRAM de ~30%.
+
+4. **Auto-stop Pod à la fin du script** :
+   ```python
+   # Ajouter à la fin de chaque script d'entraînement :
+   import runpod
+   runpod.api_key = "TON_API_KEY"
+   runpod.stop_pod(runpod.get_current_pod_id())
+   ```
+
+5. **Enchaîner les phases sur 1 seul Pod** :
+   Les phases 1a, 1c, 2 peuvent tourner séquentiellement sur le même Pod Spot
+   sans interruption. Un script maître lance tout :
+   ```bash
+   python -m scripts.pretrain --phase all --epochs 5
+   python -m ml.training.train --model deepfm --epochs 20
+   python -m ml.training.train --model mtl --epochs 10
+   python -m ml.training.train --model sim --epochs 10
+   python -m scripts.finetune_run --model all --phase 3 --epochs 3
+   python -m scripts.export_triton
+   ```
+
+6. **Ne PAS entraîner sur Recipe1M+ (13M images) sauf nécessité** :
+   Ce dataset prend ~100-200 GB et n'est utile que pour le cross-sell alimentaire.
+   Reporter au Palier 2 quand tu auras un vrai catalogue food.
+
+7. **PlantNet est optionnel** :
+   Les 8M+ images ne sont utiles que si tu as une catégorie "plantes médicinales".
+   Sous-échantillonner à 500K images max pour la v1.
