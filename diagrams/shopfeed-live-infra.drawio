@@ -1,0 +1,97 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="global_arch" name="Global Architecture">
+    <mxGraphModel dx="2000" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2000" pageHeight="1100" background="#FAFAFA" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="t1" value="Live Streaming Component Diagram" style="text;html=1;align=center;verticalAlign=middle;fontSize=32;fontStyle=1;fontColor=#111827;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="500" y="30" width="1000" height="40" as="geometry"/></mxCell>
+        <mxCell id="t2" value="AWS/C4 Style Representation of System Flow and Boundaries" style="text;html=1;align=center;fontSize=14;fontColor=#6B7280;strokeColor=none;fillColor=none;" vertex="1" parent="1"><mxGeometry x="500" y="70" width="1000" height="20" as="geometry"/></mxCell>
+        
+        <mxCell id="z_1" value="1. SOURCE TIER" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#64748B;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#64748B;" vertex="1" parent="1"><mxGeometry x="50" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_2" value="2. INGESTION GATEWAY" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#16A34A;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#16A34A;" vertex="1" parent="1"><mxGeometry x="290" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_3" value="3. ORIGIN STORAGE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#2563EB;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#2563EB;" vertex="1" parent="1"><mxGeometry x="530" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_4" value="4. TRANSCODING FARM" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#EA580C;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#EA580C;" vertex="1" parent="1"><mxGeometry x="770" y="150" width="220" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_5" value="5. EDGE PACKAGER" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9333EA;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#9333EA;" vertex="1" parent="1"><mxGeometry x="1030" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_6" value="6. GLOBAL CDN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#0D9488;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#0D9488;" vertex="1" parent="1"><mxGeometry x="1270" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="z_7" value="7. CONSUMER EDGE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#DC2626;strokeWidth=2;dashed=1;dashPattern=5 5;arcSize=2;verticalAlign=top;align=left;spacingTop=10;spacingLeft=15;fontStyle=1;fontSize=12;fontColor=#DC2626;" vertex="1" parent="1"><mxGeometry x="1510" y="150" width="200" height="480" as="geometry"/></mxCell>
+        
+        <mxCell id="app1" value="iOS Device&lt;br&gt;(HaishinKit)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F9FF;strokeColor=#0284C7;strokeWidth=1.5;fontColor=#0369A1;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="70" y="200" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="app2" value="Android Device&lt;br&gt;(HaishinKit)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F9FF;strokeColor=#0284C7;strokeWidth=1.5;fontColor=#0369A1;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="70" y="280" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="hap1" value="HAProxy LB (Primary)&lt;br&gt;TCP Load Balancing" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#16A34A;strokeWidth=1.5;fontColor=#15803D;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="310" y="240" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="hap2" value="HAProxy LB (Failover)&lt;br&gt;KeepAlived VIP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDF4;strokeColor=#16A34A;strokeWidth=1.5;fontColor=#15803D;dashed=1;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="310" y="340" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="org1" value="SRS Origin Server" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EFF6FF;strokeColor=#2563EB;strokeWidth=1.5;fontColor=#1D4ED8;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="550" y="220" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="redis" value="Redis CPX11&lt;br&gt;(Auth &amp; Metadata)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EFF6FF;strokeColor=#2563EB;strokeWidth=1.5;fontColor=#1D4ED8;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="550" y="310" width="160" height="50" as="geometry"/></mxCell>
+        
+        <mxCell id="qsv_lbl" value="Intel QSV Cluster" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7ED;strokeColor=#EA580C;strokeWidth=1.5;fontColor=#C2410C;dashed=1;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="790" y="180" width="180" height="40" as="geometry"/></mxCell>
+        
+        <mxCell id="ex1" value="Intel QSV Node 1&lt;br&gt;(i5-13500 UHD 770)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7ED;strokeColor=#EA580C;strokeWidth=1.5;fontColor=#C2410C;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="790" y="240" width="180" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="ex2" value="Intel QSV Node N&lt;br&gt;(Auto-Scaled)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7ED;strokeColor=#EA580C;strokeWidth=1.5;fontColor=#C2410C;dashed=1;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="790" y="330" width="180" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="edg" value="SRS Edge Server&lt;br&gt;(HTTP-FLV Output)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF5FF;strokeColor=#9333EA;strokeWidth=1.5;fontColor=#7E22CE;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1050" y="260" width="160" height="80" as="geometry"/></mxCell>
+        
+        <mxCell id="cdn1" value="Bunny CDN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDFA;strokeColor=#0D9488;strokeWidth=1.5;fontColor=#0F766E;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1290" y="200" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="cdn2" value="Gcore CDN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0FDFA;strokeColor=#0D9488;strokeWidth=1.5;fontColor=#0F766E;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1290" y="300" width="160" height="60" as="geometry"/></mxCell>
+        
+        <mxCell id="view" value="Client Players&lt;br&gt;Adaptive Bitrate&lt;br&gt;(360p - 720p)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF2F2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#B91C1C;shadow=0;arcSize=6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1530" y="250" width="160" height="80" as="geometry"/></mxCell>
+        
+        <mxCell id="a1" value="RTMP/SRT" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="app1" target="hap1" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a2" value="" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="app2" target="hap1" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a2b" value="Failover" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;dashed=1;" edge="1" parent="1" source="hap1" target="hap2" exitX="0" exitY="0.5" exitDx="0" exitDy="0" entryX="0" entryY="0.5" entryDx="0" entryDy="0" >
+            <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="285" y="370"/></Array></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a3" value="Ingest (vRack)" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="hap1" target="org1" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a3b" value="Token Auth" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="org1" target="redis" exitX="1" exitY="0.5" exitDx="0" exitDy="0" entryX="1" entryY="0.5" entryDx="0" entryDy="0" >
+            <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="760" y="335"/></Array></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a4" value="Lazy Pull" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="org1" target="ex1" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a5" value="x4 ABR Streams" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="ex1" target="edg" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a6" value="HTTP-FLV" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="edg" target="cdn1" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a7" value="HTTP-FLV" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="edg" target="cdn2" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a8" value="Delivery" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="cdn1" target="view" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="a9" value="" style="edgeStyle=orthogonalEdgeStyle;;rounded=1;strokeColor=#9CA3AF;strokeWidth=1.5;html=1;fontColor=#9CA3AF;fontSize=11;" edge="1" parent="1" source="cdn2" target="view" >
+            <mxGeometry relative="1" as="geometry"></mxGeometry>
+        </mxCell>
+              </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
