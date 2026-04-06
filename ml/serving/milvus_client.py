@@ -58,6 +58,7 @@ COLLECTIONS = {
         "metric": "COSINE",
         "index_type": "IVF_SQ8",
         "nlist": 4096,
+        "partition_key": True,  # Gap 5: auto-partition by category_id
     },
     "visual_embeddings": {
         "description": "CLIP visual embeddings for content similarity (512D)",
@@ -65,6 +66,7 @@ COLLECTIONS = {
         "metric": "COSINE",
         "index_type": "IVF_SQ8",
         "nlist": 4096,
+        "partition_key": True,  # Gap 5: auto-partition by category_id
     },
     "video_temporal_embeddings": {
         "description": "VideoMAE temporal embeddings (768D)",
@@ -72,6 +74,7 @@ COLLECTIONS = {
         "metric": "COSINE",
         "index_type": "IVF_SQ8",
         "nlist": 2048,
+        "partition_key": False,  # Videos are not category-specific
     },
 }
 
@@ -148,18 +151,49 @@ class MilvusVectorSearch:
                 FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=64),
                 FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=config["dim"]),
                 FieldSchema(name="metadata", dtype=DataType.JSON),
+                # Gap 5: category_id for partition routing (Pailitao pattern)
+                FieldSchema(
+                    name="category_id",
+                    dtype=DataType.INT64,
+                    is_partition_key=config.get("partition_key", False),
+                ),
+                # Gap 3: content_type for cross-modal filtering (product|video|video_frame)
+                FieldSchema(
+                    name="content_type",
+                    dtype=DataType.VARCHAR,
+                    max_length=32,
+                    default_value="product",
+                ),
             ]
             schema = CollectionSchema(fields=fields, description=config["description"])
 
             collection = Collection(name=collection_name, schema=schema)
 
-            # Build index for fast search
+            # Build vector index for fast ANN search
             index_params = {
                 "index_type": config["index_type"],
                 "metric_type": config["metric"],
                 "params": {"nlist": config["nlist"]},
             }
             collection.create_index("embedding", index_params)
+
+            # Gap 5: Scalar index on category_id for fast pre-filtering
+            if config.get("partition_key", False):
+                collection.create_index(
+                    "category_id",
+                    {"index_type": "STL_SORT"},
+                )
+                logger.info(
+                    "Milvus partition_key enabled on category_id for %s",
+                    collection_name,
+                )
+
+            # Scalar index on content_type for cross-modal filtering
+            collection.create_index(
+                "content_type",
+                {"index_type": "Trie"},
+            )
+
             collection.load()
 
             self._collections[collection_name] = collection

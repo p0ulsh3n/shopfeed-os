@@ -496,6 +496,119 @@ EXPORTERS = {
 }
 
 
+# ── CLIP ONNX Export (Search Acceleration) ─────────────────────
+
+def export_clip_vision(output_dir: str = "triton_models", config: dict | None = None) -> str:
+    """Export CLIP ViT-B/32 vision encoder to ONNX for search acceleration.
+
+    Separates vision and text encoders for independent scaling.
+    Vision encoder: used during image ingestion + visual search queries.
+    """
+    import open_clip
+
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
+    model.eval()
+
+    class VisionEncoder(torch.nn.Module):
+        def __init__(self, clip_model):
+            super().__init__()
+            self.visual = clip_model.visual
+
+        def forward(self, x):
+            return self.visual(x)
+
+    vision = VisionEncoder(model)
+    dummy = torch.randn(1, 3, 224, 224)
+
+    path = export_to_onnx(
+        model=vision,
+        model_name="clip_vision",
+        output_dir=output_dir,
+        dummy_inputs=(dummy,),
+        input_names=["pixel_values"],
+        output_names=["image_embedding"],
+    )
+
+    generate_triton_config(
+        "clip_vision", output_dir,
+        max_batch_size=256,
+        instance_count=2,
+    )
+    return path
+
+
+def export_clip_text(output_dir: str = "triton_models", config: dict | None = None) -> str:
+    """Export CLIP ViT-B/32 text encoder to ONNX for search acceleration.
+
+    Text encoder: used during text search queries (hybrid + cross-modal).
+    """
+    import open_clip
+
+    model, _, _ = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
+    model.eval()
+    tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+    class TextEncoder(torch.nn.Module):
+        def __init__(self, clip_model):
+            super().__init__()
+            self.model = clip_model
+
+        def forward(self, x):
+            return self.model.encode_text(x)
+
+    text_model = TextEncoder(model)
+    dummy_text = tokenizer(["a photo of a product"])
+
+    path = export_to_onnx(
+        model=text_model,
+        model_name="clip_text",
+        output_dir=output_dir,
+        dummy_inputs=(dummy_text,),
+        input_names=["input_ids"],
+        output_names=["text_embedding"],
+    )
+
+    generate_triton_config(
+        "clip_text", output_dir,
+        max_batch_size=512,
+        instance_count=2,
+    )
+    return path
+
+
+def export_search_reranker(model_path: str, output_dir: str, config: dict) -> str:
+    """Export LambdaMART search reranker to ONNX for GPU inference.
+
+    Uses onnxmltools to convert LightGBM booster to ONNX.
+    """
+    return export_lightgbm_fraud(model_path, output_dir, config)
+
+
+# ── A100 Triton configs for search models ──────────────────────
+
+SEARCH_MODEL_CONFIGS = {
+    "clip_vision": {
+        "batch": 256, "instances": 2, "priority": "MAX",
+        "desc": "CLIP ViT-B/32 vision encoder — image → 512d",
+    },
+    "clip_text": {
+        "batch": 512, "instances": 2, "priority": "MAX",
+        "desc": "CLIP ViT-B/32 text encoder — text → 512d",
+    },
+    "search_reranker": {
+        "batch": 2048, "instances": 1, "priority": "MAX",
+        "desc": "LambdaMART search reranker — 14 features → score",
+    },
+}
+
+# Merge search configs into main config
+A100_MODEL_CONFIGS.update(SEARCH_MODEL_CONFIGS)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export PyTorch models to ONNX for Triton A100")
     parser.add_argument("--model", choices=list(EXPORTERS.keys()), help="Single model to export")

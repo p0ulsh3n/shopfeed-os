@@ -615,3 +615,138 @@ class EmbedVideoResponse(BaseModel):
     content_type: str = Field("", description="Detected: unboxing|demo|lifestyle|review|tutorial")
     pipeline_ms: float = 0.0
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Endpoint 15 — POST /v1/search/visual  (Gap 1: Visual Search)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class VisualSearchRequest(BaseModel):
+    """Search for similar products using an image."""
+    image_url: str = Field(..., description="URL of the query image (signed URL or public CDN)")
+    category_filter: Optional[int] = Field(None, description="Explicit category filter (None = auto-predict via CLIP)")
+    user_id: Optional[str] = Field(None, description="User ID for personalized re-ranking")
+    limit: int = Field(30, ge=1, le=100, description="Max products to return")
+    include_videos: bool = Field(True, description="Attach associated vendor videos to results")
+
+
+class VisualSearchProductItem(BaseModel):
+    """Single product result from visual search."""
+    item_id: str
+    rank: int
+    visual_similarity: float = Field(..., description="CLIP cosine similarity 0-1")
+    rerank_score: float = Field(0.0, description="Final score after LambdaMART re-ranking")
+    title: str = ""
+    image_url: str = ""
+    price: float = 0.0
+    currency: str = "EUR"
+    category_id: int = 0
+    vendor_id: str = ""
+    vendor_name: str = ""
+    cv_score: float = Field(0.0, description="Photo quality score 0-1")
+    pool_level: str = "L1"
+
+
+class AssociatedVideo(BaseModel):
+    """Video associated with a product (vendor-created or auto-detected)."""
+    video_id: str
+    product_id: str
+    association_type: str = Field("explicit", description="explicit|embedding_bridge|visual_similarity")
+    score: float = Field(0.0, description="Association strength 0-1")
+    video_url: str = ""
+    thumbnail_url: str = ""
+    vendor_name: str = ""
+    content_type: str = Field("", description="unboxing|demo|lifestyle|review|tutorial")
+    duration_s: float = 0.0
+
+
+class VisualSearchResponse(BaseModel):
+    """Response for /v1/search/visual — visual similarity search."""
+    products: list[VisualSearchProductItem] = Field(default_factory=list)
+    associated_videos: list[AssociatedVideo] = Field(
+        default_factory=list,
+        description="Videos associated with the found products"
+    )
+    predicted_category: Optional[int] = Field(None, description="Auto-predicted category from image (Pailitao pattern)")
+    total_candidates: int = Field(0, description="Total candidates from ANN retrieval")
+    pipeline_ms: float = 0.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Endpoint 16 — POST /v1/search/text  (Gap 2: Hybrid Text Search)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TextSearchRequest(BaseModel):
+    """Hybrid text search: BM25 + vector + cross-modal RRF fusion."""
+    query: str = Field(..., min_length=1, max_length=500, description="Natural language search query")
+    category_filter: Optional[int] = Field(None, description="Explicit category filter")
+    min_price: Optional[float] = Field(None, ge=0, description="Minimum price filter")
+    max_price: Optional[float] = Field(None, ge=0, description="Maximum price filter")
+    user_id: Optional[str] = Field(None, description="User ID for personalized re-ranking")
+    limit: int = Field(30, ge=1, le=100)
+    include_videos: bool = Field(True, description="Attach associated vendor videos")
+
+
+class TextSearchProductItem(BaseModel):
+    """Single product result from text search."""
+    item_id: str
+    rank: int
+    rrf_score: float = Field(0.0, description="Reciprocal Rank Fusion score (BM25 + vector + cross-modal)")
+    rerank_score: float = Field(0.0, description="Final LambdaMART re-ranked score")
+    bm25_score: float = Field(0.0, description="BM25 keyword match score")
+    text_similarity: float = Field(0.0, description="Semantic vector similarity")
+    visual_similarity: float = Field(0.0, description="CLIP cross-modal visual similarity")
+    title: str = ""
+    image_url: str = ""
+    price: float = 0.0
+    currency: str = "EUR"
+    category_id: int = 0
+    vendor_id: str = ""
+    cv_score: float = 0.0
+    pool_level: str = "L1"
+
+
+class RetrievalCounts(BaseModel):
+    """Number of results from each retrieval method."""
+    bm25: int = 0
+    vector: int = 0
+    cross_modal: int = 0
+
+
+class TextSearchResponse(BaseModel):
+    """Response for /v1/search/text — hybrid BM25 + vector search."""
+    products: list[TextSearchProductItem] = Field(default_factory=list)
+    associated_videos: list[AssociatedVideo] = Field(default_factory=list)
+    query_intent: str = Field("browse", description="Detected: browse|purchase|deal_seeking|compare|informational")
+    total_candidates: int = 0
+    retrieval_counts: RetrievalCounts = Field(default_factory=RetrievalCounts)
+    pipeline_ms: float = 0.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Endpoint 17 — POST /v1/search/associated  (Gap 3: Cross-Modal Association)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class AssociatedSearchRequest(BaseModel):
+    """Find associated videos for products or products for a video."""
+    product_ids: list[str] = Field(default_factory=list, description="Product IDs to find videos for")
+    video_id: Optional[str] = Field(None, description="Video ID to find products for (bidirectional)")
+    max_results: int = Field(10, ge=1, le=50)
+
+
+class AssociatedProductItem(BaseModel):
+    """Product found in or associated with a video."""
+    product_id: str
+    video_id: str
+    association_type: str = Field("explicit", description="explicit|embedding_bridge|visual_similarity")
+    score: float = 0.0
+    title: str = ""
+    image_url: str = ""
+    price: float = 0.0
+
+
+class AssociatedSearchResponse(BaseModel):
+    """Response for /v1/search/associated — cross-modal product ↔ video."""
+    videos: list[AssociatedVideo] = Field(default_factory=list, description="Videos for given products")
+    products: list[AssociatedProductItem] = Field(default_factory=list, description="Products in given video")
+    pipeline_ms: float = 0.0
+

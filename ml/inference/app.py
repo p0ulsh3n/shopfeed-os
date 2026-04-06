@@ -50,6 +50,11 @@ from ml.inference.schemas import (
     TranscribeRequest, TranscribeResponse, TranscribedEntity,
     DuplicateCheckRequest, DuplicateCheckResponse, DuplicateMatch,
     EmbedVideoRequest, EmbedVideoResponse,
+    # Gap 1-3: Search schemas
+    VisualSearchRequest, VisualSearchResponse, VisualSearchProductItem,
+    TextSearchRequest, TextSearchResponse, TextSearchProductItem,
+    AssociatedSearchRequest, AssociatedSearchResponse,
+    AssociatedVideo, AssociatedProductItem, RetrievalCounts,
 )
 from ml.inference.health import get_health
 from ml.inference.pipeline import RankingPipeline
@@ -62,6 +67,13 @@ _registry = None
 _faiss_index = None
 _pipeline: RankingPipeline | None = None
 _start_time = time.time()
+
+# Gap 1-5: Search module globals
+_visual_search = None
+_hybrid_search = None
+_cross_modal = None
+_search_reranker = None
+_category_router = None
 
 
 @asynccontextmanager
@@ -95,8 +107,79 @@ async def lifespan(app: FastAPI):
         redis_client=None,  # injecté si Redis disponible
     )
 
+    # ── Gap 1-5 + 15% completions: Initialize search modules ─────────
+    global _visual_search, _hybrid_search, _cross_modal, _search_reranker, _category_router
+
+    try:
+        from ml.search.reranker import SearchReranker
+        from ml.search.category_router import CategoryRouter
+        from ml.search.cross_modal import CrossModalBridge
+        from ml.search.visual_search import VisualSearchPipeline
+        from ml.search.hybrid_search import HybridSearchPipeline
+
+        _search_reranker = SearchReranker()
+        _category_router = CategoryRouter()
+        _cross_modal = CrossModalBridge(
+            milvus_client=None,
+            redis_client=None,
+        )
+
+        # ── Production: Elasticsearch backend ──────────────────
+        _es_backend = None
+        try:
+            from ml.search.elasticsearch_backend import ElasticsearchBackend
+            _es_backend = ElasticsearchBackend()
+            await _es_backend.connect()
+            if _es_backend._connected:
+                await _es_backend.create_index()
+                count = await _es_backend.get_product_count()
+                logger.info("Elasticsearch connected: %d products indexed", count)
+        except Exception as e:
+            logger.info("Elasticsearch not available (using in-memory BM25): %s", e)
+            _es_backend = None
+
+        # ── Production: ONNX CLIP inference (2-5x faster) ──────
+        _clip_onnx = None
+        try:
+            from ml.search.clip_onnx_inference import CLIPOnnxInference
+            _clip_onnx = CLIPOnnxInference()
+            if _clip_onnx.load():
+                logger.info("CLIP ONNX loaded (TensorRT/CUDA accelerated)")
+            else:
+                _clip_onnx = None
+        except Exception as e:
+            logger.info("CLIP ONNX not available (using PyTorch): %s", e)
+            _clip_onnx = None
+
+        _visual_search = VisualSearchPipeline(
+            milvus_client=None,
+            faiss_index=_faiss_index,
+            reranker=_search_reranker,
+            cross_modal=_cross_modal,
+            category_router=_category_router,
+        )
+        _hybrid_search = HybridSearchPipeline(
+            milvus_client=None,
+            faiss_index=_faiss_index,
+            reranker=_search_reranker,
+            cross_modal=_cross_modal,
+            category_router=_category_router,
+            es_backend=_es_backend,
+            clip_onnx=_clip_onnx,
+        )
+        logger.info("Search modules loaded (Gaps 1-5 + ES + ONNX).")
+    except Exception as e:
+        logger.warning(f"Search modules failed to load: {e}")
+
     logger.info("ML Inference API ready.")
     yield
+
+    # ── Shutdown: close ES connection properly ─────────────────
+    try:
+        if _es_backend and _es_backend._connected:
+            await _es_backend.close()
+    except Exception:
+        pass
 
     logger.info("Shutting down ML Inference API.")
 
@@ -945,6 +1028,335 @@ async def embed_video(request: EmbedVideoRequest) -> EmbedVideoResponse:
             embedding=np.zeros(768).tolist(),
             pipeline_ms=(time.perf_counter() - t_start) * 1000,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 15 — POST /v1/search/visual  ⚡ Gap 1: Visual Search
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/search/visual",
+    response_model=VisualSearchResponse,
+    summary="Visual search — upload image → find similar products + associated videos",
+    tags=["Search"],
+)
+async def search_visual(request: VisualSearchRequest) -> VisualSearchResponse:
+    """Visual product search pipeline (Gap 1).
+
+    1. CLIP encode query image → 512d embedding (cached)
+    2. Category prediction via CLIP zero-shot (Gap 5, Pailitao pattern)
+    3. Milvus ANN search on visual_embeddings (pre-filtered by category)
+    4. LambdaMART re-ranking with business signals (Gap 4)
+    5. Cross-modal enrichment — attach associated vendor videos (Gap 3)
+
+    SLA target: <200ms
+    """
+    if _visual_search is None:
+        raise HTTPException(status_code=503, detail="Visual search module not loaded")
+
+    t_start = time.perf_counter()
+
+    # Get user profile for personalization
+    user_profile = None
+    if request.user_id and _registry:
+        try:
+            loop = asyncio.get_event_loop()
+            user_profile = await loop.run_in_executor(
+                None, lambda: _registry.get_user_profile(request.user_id)
+            )
+        except Exception:
+            pass
+
+    # Execute visual search pipeline
+    result = await _visual_search.search(
+        image_url=request.image_url,
+        user_profile=user_profile,
+        category_filter=request.category_filter,
+        limit=request.limit,
+        include_videos=request.include_videos,
+    )
+
+    # Build response
+    products = []
+    for i, p in enumerate(result.get("products", [])):
+        products.append(VisualSearchProductItem(
+            item_id=p["item_id"],
+            rank=i + 1,
+            visual_similarity=p.get("visual_similarity", 0.0),
+            rerank_score=p.get("rerank_score", 0.0),
+            title=p.get("title", ""),
+            image_url=p.get("image_url", ""),
+            price=p.get("price", 0.0),
+            category_id=p.get("category_id", 0),
+            vendor_id=p.get("vendor_id", ""),
+            cv_score=p.get("cv_score", 0.0),
+            pool_level=p.get("pool_level", "L1"),
+        ))
+
+    videos = [
+        AssociatedVideo(**v) for v in result.get("associated_videos", [])
+    ]
+
+    return VisualSearchResponse(
+        products=products,
+        associated_videos=videos,
+        predicted_category=result.get("predicted_category"),
+        total_candidates=result.get("total_candidates", 0),
+        pipeline_ms=result.get("pipeline_ms", 0.0),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 16 — POST /v1/search/text  ⚡ Gap 2: Hybrid Text Search
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/search/text",
+    response_model=TextSearchResponse,
+    summary="Hybrid text search — BM25 + vector + cross-modal RRF(k=60) fusion",
+    tags=["Search"],
+)
+async def search_text(request: TextSearchRequest) -> TextSearchResponse:
+    """Hybrid text search pipeline (Gap 2).
+
+    Runs 3 parallel retrievals:
+    1. BM25 keyword search (exact terms, SKUs, brands)
+    2. Semantic vector search (text encoder → Milvus ANN)
+    3. Cross-modal CLIP text → visual embeddings
+
+    Fused via Reciprocal Rank Fusion (RRF k=60, industry standard 2026).
+    Then re-ranked by LambdaMART with business signals (Gap 4).
+    Finally enriched with associated vendor videos (Gap 3).
+
+    SLA target: <250ms
+    """
+    if _hybrid_search is None:
+        raise HTTPException(status_code=503, detail="Hybrid search module not loaded")
+
+    # Get user profile
+    user_profile = None
+    if request.user_id and _registry:
+        try:
+            loop = asyncio.get_event_loop()
+            user_profile = await loop.run_in_executor(
+                None, lambda: _registry.get_user_profile(request.user_id)
+            )
+        except Exception:
+            pass
+
+    # Execute hybrid search
+    result = await _hybrid_search.search(
+        query=request.query,
+        user_profile=user_profile,
+        category_filter=request.category_filter,
+        min_price=request.min_price,
+        max_price=request.max_price,
+        limit=request.limit,
+        include_videos=request.include_videos,
+    )
+
+    # Build response
+    products = []
+    for i, p in enumerate(result.get("products", [])):
+        products.append(TextSearchProductItem(
+            item_id=p["item_id"],
+            rank=i + 1,
+            rrf_score=p.get("rrf_score", 0.0),
+            rerank_score=p.get("rerank_score", 0.0),
+            bm25_score=p.get("bm25_score", 0.0),
+            text_similarity=p.get("text_similarity", 0.0),
+            visual_similarity=p.get("visual_similarity", 0.0),
+            title=p.get("title", ""),
+            image_url=p.get("image_url", ""),
+            price=p.get("price", 0.0),
+            category_id=p.get("category_id", 0),
+            vendor_id=p.get("vendor_id", ""),
+            cv_score=p.get("cv_score", 0.0),
+            pool_level=p.get("pool_level", "L1"),
+        ))
+
+    videos = [
+        AssociatedVideo(**v) for v in result.get("associated_videos", [])
+    ]
+
+    counts = result.get("retrieval_counts", {})
+
+    return TextSearchResponse(
+        products=products,
+        associated_videos=videos,
+        query_intent=result.get("query_intent", "browse"),
+        total_candidates=result.get("total_candidates", 0),
+        retrieval_counts=RetrievalCounts(
+            bm25=counts.get("bm25", 0),
+            vector=counts.get("vector", 0),
+            cross_modal=counts.get("cross_modal", 0),
+        ),
+        pipeline_ms=result.get("pipeline_ms", 0.0),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 17 — POST /v1/search/associated  ⚡ Gap 3: Cross-Modal Association
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/search/associated",
+    response_model=AssociatedSearchResponse,
+    summary="Cross-modal association — find videos for products or products in a video",
+    tags=["Search"],
+)
+async def search_associated(
+    request: AssociatedSearchRequest,
+) -> AssociatedSearchResponse:
+    """Cross-modal product ↔ video association (Gap 3).
+
+    Bidirectional search:
+    - product_ids → find vendor videos featuring those products
+    - video_id → find products that appear in the video
+
+    Uses 3 strategies (in priority order):
+    1. Explicit mapping: vendor-created product↔video links (Redis)
+    2. Embedding bridge: shared projection space (CLIP→256d←VideoMAE)
+    3. Visual similarity: CLIP cosine between product images and video frames
+
+    SLA target: <150ms
+    """
+    if _cross_modal is None:
+        raise HTTPException(status_code=503, detail="Cross-modal module not loaded")
+
+    t_start = time.perf_counter()
+    videos = []
+    products = []
+
+    # Product → Video
+    if request.product_ids:
+        raw_videos = await _cross_modal.find_videos_for_products(
+            request.product_ids,
+            max_videos_per_product=request.max_results,
+        )
+        videos = [AssociatedVideo(**v) for v in raw_videos]
+
+    # Video → Product
+    if request.video_id:
+        raw_products = await _cross_modal.find_products_in_video(
+            request.video_id,
+            max_products=request.max_results,
+        )
+        products = [AssociatedProductItem(**p) for p in raw_products]
+
+    pipeline_ms = (time.perf_counter() - t_start) * 1000
+
+    return AssociatedSearchResponse(
+        videos=videos,
+        products=products,
+        pipeline_ms=pipeline_ms,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 18 — POST /v1/search/click   ⚡ Click Event Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/search/click",
+    summary="Log search interaction event (impression, click, cart, purchase)",
+    tags=["Search"],
+)
+async def search_click_event(
+    event_type: str,
+    query_id: str,
+    product_id: str,
+    position: int = 0,
+    query_text: str = "",
+    query_type: str = "text",
+    user_id: str = "",
+):
+    """Log a search interaction for LambdaMART training.
+
+    Call this endpoint when:
+    - Products are shown (event_type=impression, with position + features)
+    - User clicks a result (event_type=click)
+    - User adds to cart (event_type=cart)
+    - User purchases (event_type=purchase)
+
+    These events feed the automated LambdaMART retraining pipeline.
+    """
+    try:
+        from ml.search.click_training import SearchClickCollector
+        collector = SearchClickCollector(redis_client=None)  # Wire Redis in prod
+        await collector.log_event(
+            event_type=event_type,
+            query_id=query_id,
+            product_id=product_id,
+            position=position,
+            query_text=query_text,
+            query_type=query_type,
+            user_id=user_id,
+        )
+        return {"status": "logged", "event_type": event_type, "query_id": query_id}
+    except Exception as e:
+        logger.warning(f"Click event logging failed: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 19 — POST /v1/search/train   ⚡ LambdaMART Auto-Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/search/train",
+    summary="Trigger LambdaMART retraining from collected click logs",
+    tags=["Search", "Training"],
+)
+async def search_train_reranker():
+    """Trigger automated LambdaMART retraining pipeline.
+
+    Pipeline:
+    1. Extract click logs from Redis Streams (last 30 days)
+    2. Build query-document pairs with relevance labels
+    3. Apply position bias correction (propensity scoring)
+    4. Train LightGBM LambdaMART (NDCG@10 objective)
+    5. Validate against quality gate (NDCG@10 >= 0.5)
+    6. Deploy model atomically (backup + swap)
+
+    Call this daily via cron or Airflow. Training takes ~30s for 10K queries.
+    """
+    try:
+        from ml.search.click_training import LambdaMARTTrainingPipeline
+        pipeline = LambdaMARTTrainingPipeline(redis_client=None)
+        result = await pipeline.run()
+
+        # Reload reranker if new model deployed
+        if result.get("deployed") and _search_reranker:
+            _search_reranker.reload_model()
+            logger.info("Reranker model hot-reloaded after training.")
+
+        return result
+    except Exception as e:
+        logger.error(f"LambdaMART training failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 20 — GET /v1/search/autocomplete   ⚡ Search Suggestions
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/v1/search/autocomplete",
+    summary="Autocomplete search suggestions (edge_ngram via Elasticsearch)",
+    tags=["Search"],
+)
+async def search_autocomplete(prefix: str, limit: int = 5):
+    """Fast autocomplete suggestions using Elasticsearch edge_ngram.
+
+    Returns title suggestions matching the prefix, deduplicated.
+    Requires Elasticsearch backend to be active.
+    """
+    if _hybrid_search and hasattr(_hybrid_search, 'es_backend') and _hybrid_search.es_backend:
+        suggestions = await _hybrid_search.es_backend.autocomplete(prefix, limit)
+        return {"suggestions": suggestions, "count": len(suggestions)}
+
+    return {"suggestions": [], "count": 0, "note": "Elasticsearch not available"}
 
 
 # ── Exception handlers ───────────────────────────────────────────────────────
