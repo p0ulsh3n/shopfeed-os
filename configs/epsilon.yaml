@@ -1,0 +1,49 @@
+# ============================================================
+# EPSILON Ad Engine Configuration
+# ============================================================
+
+# ── Targeting Strategy Weights ──────────────────────────────
+targeting:
+  weights:
+    local: 0.15
+    behavioral: 0.30
+    lookalike: 0.20
+    interest: 0.15
+    desire_graph: 0.20
+  max_audience_size: 10000
+  strategies_by_tier:
+    starter: [local, behavioral]
+    growth: [local, behavioral, lookalike, interest]
+    premium: [local, behavioral, lookalike, interest, desire_graph]
+
+# ── Ad Ranking ──────────────────────────────────────────────
+ranking:
+  ecpm_formula: hybrid      # hybrid | conversion_only | traffic_only
+  conversion_weight: 0.6    # eCPM = 0.6*pConv + 0.4*pTraffic
+  traffic_weight: 0.4
+  quality_score_floor: 0.3  # Min quality to avoid penalty
+  creative_quality_weight: 0.1
+
+# ── Budget Pacing ───────────────────────────────────────────
+budget:
+  pacing_algorithm: proportional  # proportional | smooth
+  min_daily_spend_ratio: 0.7      # Min spend vs target
+  max_hourly_boost: 1.5           # Max hourly spend multiplier
+  midnight_reset: true
+
+# ── Fatigue Control ─────────────────────────────────────────
+fatigue:
+  max_impressions_per_user_per_day: 3
+  cooldown_hours: 6
+  frequency_cap_per_campaign: 5
+
+# ── Uplift Filtering ────────────────────────────────────────
+uplift:
+  min_uplift_threshold: 0.01  # Min incremental conversion lift
+  treatment_effect_method: t-learner  # t-learner | s-learner | x-learner
+
+# ── Auction ─────────────────────────────────────────────────
+auction:
+  type: gsp                  # gsp (Generalized Second Price) | vickrey
+  reserve_price_cpc: 0.05    # Minimum CPC in EUR
+  reserve_price_cpm: 1.00    # Minimum CPM in EUR

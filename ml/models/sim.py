@@ -41,7 +41,7 @@ class SDIMModule(nn.Module):
     def forward(self, item_ids: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
         """
         item_ids: [batch, seq_len] — IDs des items historique long-terme
-        embeddings: [batch, seq_len, item_dim]
+        embeddings: [batch, seq_len, item_dim] — pre-computed item embeddings
         Returns: [batch, item_dim] — représentation compressée de l'historique
         """
         # Random hash bucketing pour retrieval efficace
@@ -53,7 +53,13 @@ class SDIMModule(nn.Module):
             hash_outputs.append(h_emb.mean(dim=1))  # [batch, item_dim//4]
 
         hash_repr = torch.cat(hash_outputs, dim=-1)  # [batch, item_dim]
-        return self.proj(hash_repr)
+
+        # Residual connection with actual embeddings for richer representation
+        # Hash alone loses fine-grained item semantics; embeddings preserve them
+        emb_pool = embeddings.mean(dim=1)  # [batch, item_dim]
+        combined = hash_repr + emb_pool  # residual fusion
+
+        return self.proj(combined)
 
 
 class SIMAttentionUnit(nn.Module):
@@ -110,6 +116,8 @@ class SIMModel(nn.Module):
         super().__init__()
         self.item_dim = item_dim
         self.top_k_hard = top_k_hard
+        self.short_seq_len = short_seq_len
+        self.long_seq_len = long_seq_len
 
         # Item embeddings partagés
         self.item_embedding = nn.Embedding(num_items + 1, item_dim, padding_idx=0)

@@ -1,0 +1,133 @@
+# ============================================================
+# ShopFeed ML Training Configuration
+# ============================================================
+# All model hyperparameters, feature dimensions, and training
+# settings in one place. Import via:
+#   from ml.configs import load_training_config
+# ============================================================
+
+# ── Feature Dimensions ──────────────────────────────────────
+features:
+  user_dense_dim: 764     # 256 (CLIP) + 500 (cat prefs) + 3 + 3 + 2
+  item_dense_dim: 1348    # 512 (CLIP) + 768 (text) + 1 + N_cat + 1 + 1 + 64 + 1
+  embedding_dim: 256      # Shared embedding space dimension
+  n_categories: 500       # Product categories count
+  n_items: 1000000        # Maximum item vocabulary
+
+# ── Model: Two-Tower ────────────────────────────────────────
+two_tower:
+  embedding_dim: 256
+  hidden_dims: [512, 256]
+  temperature: 0.07
+  dropout: 0.1
+
+# ── Model: DeepFM ───────────────────────────────────────────
+deepfm:
+  num_sparse_features: 5000
+  fm_embedding_dim: 16
+  dnn_hidden_dims: [512, 256, 128]
+  dropout: 0.1
+
+# ── Model: MTL/PLE ──────────────────────────────────────────
+mtl:
+  tasks:
+    click:
+      weight: 1.0
+    add_to_cart:
+      weight: 1.5
+    purchase:
+      weight: 3.0
+    save:
+      weight: 0.8
+    share:
+      weight: 0.5
+    vendor_click:
+      weight: 2.0
+    store_visit:
+      weight: 2.5
+  num_experts: 6
+  expert_hidden: 256
+  num_shared_experts: 2
+  hidden_dims: [512, 256, 128]
+  dropout: 0.1
+
+# ── Model: DIN ──────────────────────────────────────────────
+din:
+  embed_dim: 64
+  mlp_dims: [256, 128, 64]
+  n_tasks: 3
+  dropout: 0.1
+  attention_hidden: [64, 32]
+
+# ── Model: DIEN ─────────────────────────────────────────────
+dien:
+  embed_dim: 64
+  hidden_size: 64
+  mlp_dims: [256, 128, 64]
+  n_tasks: 3
+  dropout: 0.1
+  aux_loss_weight: 0.1
+
+# ── Model: BST ──────────────────────────────────────────────
+bst:
+  embed_dim: 64
+  n_heads: 4
+  n_transformer_blocks: 2
+  ff_dim: 128
+  max_seq_len: 200
+  mlp_dims: [256, 128, 64]
+  n_tasks: 3
+  dropout: 0.1
+
+# ── Model: SIM ──────────────────────────────────────────────
+sim:
+  item_dim: 64
+  user_dim: 64
+  short_seq_len: 50
+  long_seq_len: 1000
+  top_k_hard: 50
+  num_hash_buckets: 10000
+  hash_layers: 4
+  dropout: 0.1
+
+# ── Training Defaults ───────────────────────────────────────
+training:
+  batch_size: 2048
+  epochs: 20
+  learning_rate: 0.001
+  weight_decay: 0.01
+  val_split: 0.1              # 10% validation (hyperparameter tuning, early stopping)
+  test_split: 0.1             # 10% test (held-out, final evaluation only)
+  temporal_split: true        # Temporal split for sequence models (DIN/DIEN/BST)
+  mixed_precision: true
+  gradient_clip: 1.0
+  num_workers: 4
+  scheduler: cosine
+  warmup_epochs: 2
+  early_stopping_patience: 5
+  seed: 42
+
+# ── Fine-Tuning (LoRA) ─────────────────────────────────────
+finetune:
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  learning_rate: 0.0002
+  epochs: 10
+  freeze_phases:
+    phase_1:
+      frozen: ["embedding", "attention", "gru_layer", "category_embedding"]
+    phase_2:
+      frozen: ["embedding", "input_layer", "gru_layer"]
+    phase_3:
+      frozen: ["embedding", "input_layer"]
+      lora: true
+    phase_4:
+      frozen: []
+
+# ── Pre-Training ────────────────────────────────────────────
+pretrain:
+  epochs: 5
+  batch_size: 512
+  learning_rate: 0.001
+  max_samples: 5000000

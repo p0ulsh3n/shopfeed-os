@@ -221,19 +221,39 @@ class RedpandaConsumer:
     async def consume(self, handler: Callable, batch_size: int = 100) -> None:
         """Consume messages and process with handler function.
 
-        The handler receives a list of deserialized message dicts.
-        This is the main event loop for streaming consumers.
+        If batch_size > 1, collects messages into batches before calling handler.
+        handler receives a single message dict (batch_size=1) or list of dicts.
         """
         if not self._consumer:
             return
 
         try:
-            async for msg in self._consumer:
-                try:
-                    await handler(msg.value)
-                except Exception as e:
-                    logger.error("Handler error: topic=%s offset=%d error=%s",
-                                 msg.topic, msg.offset, e)
+            if batch_size <= 1:
+                # Single-message mode
+                async for msg in self._consumer:
+                    try:
+                        await handler(msg.value)
+                    except Exception as e:
+                        logger.error("Handler error: topic=%s offset=%d error=%s",
+                                     msg.topic, msg.offset, e)
+            else:
+                # Batch mode — collect batch_size messages then process
+                batch = []
+                async for msg in self._consumer:
+                    batch.append(msg.value)
+                    if len(batch) >= batch_size:
+                        try:
+                            await handler(batch)
+                        except Exception as e:
+                            logger.error("Batch handler error: batch_size=%d error=%s",
+                                         len(batch), e)
+                        batch = []
+                # Process remaining messages
+                if batch:
+                    try:
+                        await handler(batch)
+                    except Exception as e:
+                        logger.error("Final batch handler error: %s", e)
         except Exception as e:
             logger.error("Consumer loop error: %s", e)
         finally:

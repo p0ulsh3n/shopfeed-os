@@ -285,3 +285,258 @@ def get_fashion_siglip_model_id() -> str:
 def get_fashion_clip_fallback_id() -> str:
     """Get the fallback FashionCLIP 2.0 model ID."""
     return "patrickjohncyh/fashion-clip"
+
+
+# ─── Batch Loaders for pretrain.py & finetune_run.py ────────────
+
+
+class AlibabaUserBehaviorLoader:
+    """Wraps Alibaba UserBehavior HuggingFace dataset into batches
+    of (user_features, item_features, labels) for Two-Tower pre-training.
+
+    This loader streams REAL data from HuggingFace — zero simulation.
+    """
+
+    def __init__(self, batch_size: int = 256, max_samples: int | None = None):
+        self.batch_size = batch_size
+        self.max_samples = max_samples
+        self._dataset = None
+
+    def _load(self) -> None:
+        if self._dataset is not None:
+            return
+        self._dataset = load_hf_dataset(
+            "alibaba_userbehavior", split="train", streaming=True,
+        )
+
+    def get_batches(self):
+        """Yields batches of {user_features, item_features, labels}."""
+        self._load()
+        batch_user: list = []
+        batch_item: list = []
+        batch_labels: list = []
+        n_seen = 0
+
+        for row in self._dataset:
+            if self.max_samples and n_seen >= self.max_samples:
+                break
+
+            # Map raw Alibaba fields to feature vectors
+            user_id = int(row.get("user_id", row.get("userid", 0)))
+            item_id = int(row.get("item_id", row.get("itemid", 0)))
+            cat_id = int(row.get("category_id", row.get("item_category", 0)))
+            btype = row.get("behavior_type", row.get("event", "pv"))
+            ts = float(row.get("timestamp", 0))
+
+            # Build minimal dense features (real data, no simulation)
+            # user_features: [user_id_hash, activity_hour, day_of_week, ...]
+            import math
+            hour = (ts % 86400) / 3600.0 if ts > 0 else 12.0
+            day = (ts % 604800) / 86400.0 if ts > 0 else 3.0
+            user_feat = torch.zeros(764)
+            user_feat[0] = (user_id % 1000) / 1000.0  # hashed user signal
+            user_feat[1] = hour / 24.0
+            user_feat[2] = day / 7.0
+            # Sparse category preference in user vector
+            cat_idx = min(cat_id % 100, 99)
+            user_feat[10 + cat_idx] = 1.0
+
+            # item_features: [item_id_hash, category, ...]
+            item_feat = torch.zeros(1348)
+            item_feat[0] = (item_id % 10000) / 10000.0
+            item_feat[1] = (cat_id % 500) / 500.0
+
+            # Labels: 1 for purchase, 0 for view
+            label = 1.0 if btype in ("buy", "purchase", "transaction") else 0.0
+
+            batch_user.append(user_feat)
+            batch_item.append(item_feat)
+            batch_labels.append(label)
+            n_seen += 1
+
+            if len(batch_user) >= self.batch_size:
+                yield {
+                    "user_features": torch.stack(batch_user),
+                    "item_features": torch.stack(batch_item),
+                    "labels": torch.tensor(batch_labels, dtype=torch.float32),
+                }
+                batch_user, batch_item, batch_labels = [], [], []
+
+        # Last partial batch
+        if batch_user:
+            yield {
+                "user_features": torch.stack(batch_user),
+                "item_features": torch.stack(batch_item),
+                "labels": torch.tensor(batch_labels, dtype=torch.float32),
+            }
+
+
+class AlibabaSequenceLoader:
+    """Wraps Alibaba UserBehavior into behavior sequences for DIN/DIEN/BST.
+
+    Groups interactions by user, sorts by timestamp, builds sequences.
+    This loader streams REAL data from HuggingFace — zero simulation.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 128,
+        max_seq_len: int = 200,
+        max_users: int | None = None,
+    ):
+        self.batch_size = batch_size
+        self.max_seq_len = max_seq_len
+        self.max_users = max_users
+        self._built = False
+        self._dataset: BehaviorSequenceDataset | None = None
+
+    def _build(self) -> None:
+        if self._built:
+            return
+
+        # Stream raw interactions from HuggingFace
+        raw_ds = load_hf_dataset(
+            "alibaba_userbehavior", split="train", streaming=True,
+        )
+
+        interactions: list[dict] = []
+        user_counts: dict[int, int] = {}
+        for row in raw_ds:
+            uid = int(row.get("user_id", row.get("userid", 0)))
+
+            # Limit users if specified
+            if self.max_users:
+                if uid not in user_counts and len(user_counts) >= self.max_users:
+                    continue
+                user_counts.setdefault(uid, 0)
+                user_counts[uid] += 1
+
+            interactions.append({
+                "user_id": uid,
+                "item_id": int(row.get("item_id", row.get("itemid", 0))),
+                "category_id": int(row.get("category_id", row.get("item_category", 0))),
+                "behavior_type": row.get("behavior_type", row.get("event", "pv")),
+                "timestamp": float(row.get("timestamp", 0)),
+            })
+
+            # Stop after reasonable size for pre-training
+            if len(interactions) >= 5_000_000:
+                break
+
+        self._dataset = BehaviorSequenceDataset(
+            interactions, max_seq_len=self.max_seq_len, min_seq_len=1,
+        )
+        self._built = True
+        logger.info(
+            "AlibabaSequenceLoader built: %d samples from %d interactions",
+            len(self._dataset), len(interactions),
+        )
+
+    def get_batches(self):
+        """Yields batches of behavior sequence dicts."""
+        self._build()
+        loader = torch.utils.data.DataLoader(
+            self._dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+        yield from loader
+
+
+class ProprietaryInteractionsLoader:
+    """Loads proprietary ShopFeed interaction data for fine-tuning.
+
+    Expects pre-processed data at data/finetune/{model_type}/ as:
+      - train.parquet  (training set)
+      - val.parquet    (validation set — MANDATORY for checkpoint selection)
+
+    If data files don't exist, raises FileNotFoundError to prevent
+    silent failures / mock data training.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 128,
+        model_type: str = "din",
+        data_dir: str = "data/finetune",
+    ):
+        import os
+        self.batch_size = batch_size
+        self.model_type = model_type
+        self.data_dir = os.path.join(data_dir, model_type)
+        self._train_ds: Dataset | None = None
+        self._val_ds: Dataset | None = None
+        self._load()
+
+    def _load(self) -> None:
+        import os
+        import pandas as pd
+
+        train_path = os.path.join(self.data_dir, "train.parquet")
+        val_path = os.path.join(self.data_dir, "val.parquet")
+
+        if not os.path.exists(train_path):
+            raise FileNotFoundError(
+                f"Fine-tuning training data not found: {train_path}\n"
+                f"Run `python -m scripts.prepare_data --finetune` first."
+            )
+
+        # Load training data
+        train_df = pd.read_parquet(train_path)
+        train_interactions = train_df.to_dict("records")
+
+        if self.model_type in ("din", "dien", "bst"):
+            self._train_ds = BehaviorSequenceDataset(
+                train_interactions, max_seq_len=200, min_seq_len=1,
+            )
+        else:
+            from ml.training.train import InteractionDataset
+            self._train_ds = InteractionDataset(train_path)
+
+        # Load validation data
+        if os.path.exists(val_path):
+            val_df = pd.read_parquet(val_path)
+            val_interactions = val_df.to_dict("records")
+            if self.model_type in ("din", "dien", "bst"):
+                self._val_ds = BehaviorSequenceDataset(
+                    val_interactions, max_seq_len=200, min_seq_len=1,
+                )
+            else:
+                from ml.training.train import InteractionDataset
+                self._val_ds = InteractionDataset(val_path)
+        else:
+            # Split 85/15 from training if no separate val set
+            total = len(self._train_ds)
+            val_size = int(total * 0.15)
+            train_size = total - val_size
+            from torch.utils.data import Subset
+            indices = list(range(total))
+            self._val_ds = Subset(self._train_ds, indices[train_size:])
+            self._train_ds = Subset(self._train_ds, indices[:train_size])
+
+        logger.info(
+            "ProprietaryInteractionsLoader: train=%d val=%d (model=%s)",
+            len(self._train_ds), len(self._val_ds), self.model_type,
+        )
+
+    def get_batches(self):
+        """Yields training batches."""
+        loader = torch.utils.data.DataLoader(
+            self._train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+        yield from loader
+
+    def get_val_batches(self):
+        """Yields validation batches — used for checkpoint selection."""
+        loader = torch.utils.data.DataLoader(
+            self._val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        yield from loader
+

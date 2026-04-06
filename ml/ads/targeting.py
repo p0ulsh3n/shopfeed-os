@@ -160,7 +160,11 @@ class AudienceTargeting:
         if not self.redis:
             return
         try:
-            user_ids = self.redis.smembers(f"geo:{geo_zone}:active_users")
+            # Try category-specific geo set first, fallback to general geo
+            geo_key = f"geo:{geo_zone}:cat:{category}:active_users"
+            user_ids = self.redis.smembers(geo_key)
+            if not user_ids:
+                user_ids = self.redis.smembers(f"geo:{geo_zone}:active_users")
             for uid in (user_ids or []):
                 uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
                 if uid_str not in matches:
@@ -227,10 +231,16 @@ class AudienceTargeting:
             query = ad_embedding.reshape(1, -1).astype(np.float32)
             neighbor_ids, distances = self.faiss_index.search(query, k=5000)
 
+            # Build seed set for filtering (don't re-target seed users)
+            seed_set = set(seed_user_ids) if seed_user_ids else set()
+
             for i, uid in enumerate(neighbor_ids[0]):
                 if uid == -1:
                     continue
                 uid_str = str(uid)
+                # Skip seed users — they're already converted customers
+                if uid_str in seed_set:
+                    continue
                 if uid_str not in matches:
                     matches[uid_str] = TargetedUser(user_id=uid_str)
                 # Score decays with distance
@@ -347,6 +357,26 @@ class AudienceTargeting:
         # Retarget boost: users who already visited the vendor
         if "vendor_retarget" in user.match_reasons:
             base_prob *= 3.0  # 3× more likely to revisit
+
+        # Check vendor-specific visit count from Redis for recency boost
+        if self.redis and vendor_id:
+            try:
+                visit_count = self.redis.get(f"vendor:{vendor_id}:user:{user.user_id}:visits")
+                if visit_count and int(visit_count) > 2:
+                    base_prob *= 1.5  # Repeat visitors are more likely
+            except Exception:
+                pass
+
+        # Category affinity boost — users active in this category convert better
+        if self.redis and category:
+            try:
+                cat_score = self.redis.zscore(
+                    f"category:{category}:active_users", user.user_id
+                )
+                if cat_score and float(cat_score) > 0.5:
+                    base_prob *= 1.4
+            except Exception:
+                pass
 
         # Desire boost
         if user.desire_score > 0.5:

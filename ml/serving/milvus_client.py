@@ -275,11 +275,28 @@ class MilvusVectorSearch:
         """Fall back to FAISS when Milvus is unavailable."""
         try:
             from ml.serving.faiss_index import FaissIndex
-            # FAISS index must be pre-built
-            logger.info("Using FAISS fallback for %s", collection_name)
-            # Delegate to existing FAISS implementation
-            return [[] for _ in query_vectors]  # Empty if FAISS not loaded
-        except ImportError:
+            import numpy as np
+
+            index = FaissIndex.get_instance()
+            if index is None or index.index is None:
+                return [[] for _ in query_vectors]
+
+            logger.info("Using FAISS fallback for %s (top_k=%d)", collection_name, top_k)
+            results = []
+            for qv in query_vectors:
+                query = np.array([qv], dtype=np.float32)
+                item_ids, scores = index.search(query, k=top_k)
+                batch_results = []
+                for item_id, score in zip(item_ids[0], scores[0]):
+                    if item_id != -1:
+                        batch_results.append({
+                            "id": str(item_id),
+                            "score": float(score),
+                        })
+                results.append(batch_results)
+            return results
+        except (ImportError, Exception) as e:
+            logger.warning("FAISS fallback search failed: %s", e)
             return [[] for _ in query_vectors]
 
     def delete(self, collection_name: str, ids: list[str]) -> int:

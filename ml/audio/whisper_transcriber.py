@@ -26,8 +26,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Whisper model
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
+# Whisper model — default to turbo (6x faster, ~same accuracy)
+# Override via env: WHISPER_MODEL=large-v3 for max accuracy
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 
 _whisper_model = None
 
@@ -38,9 +39,18 @@ def _load_whisper():
         return _whisper_model
     try:
         import whisper
-        logger.info(f"Loading Whisper model: {WHISPER_MODEL_SIZE}")
-        _whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
-        logger.info("Whisper model loaded.")
+        model_name = WHISPER_MODEL_SIZE
+        logger.info(f"Loading Whisper model: {model_name}")
+        try:
+            _whisper_model = whisper.load_model(model_name)
+        except Exception:
+            # Fallback: if turbo not available in installed whisper version
+            if "turbo" in model_name:
+                logger.warning(f"Whisper {model_name} not available, falling back to large-v3")
+                _whisper_model = whisper.load_model("large-v3")
+            else:
+                raise
+        logger.info(f"Whisper model loaded: {_whisper_model}")
     except ImportError:
         logger.warning("openai-whisper not installed. Transcription unavailable.")
     except Exception as e:

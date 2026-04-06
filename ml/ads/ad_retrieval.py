@@ -211,4 +211,7 @@ class MultiModalAdRetrieval:
         intent = intent_map.get(temporal_features.get("intent_level", "low"), 0.2)
         weekend_boost = float(temporal_features.get("is_weekend", False)) * 0.1
 
-        return min(1.0, vulnerability * 0.5 + intent * 0.4 + weekend_boost)
+        # Video ads perform better in high-engagement sessions (evening/night)
+        creative_boost = 0.05 if ad.creative_type == "video" and vulnerability > 0.6 else 0.0
+
+        return min(1.0, vulnerability * 0.5 + intent * 0.4 + weekend_boost + creative_boost)

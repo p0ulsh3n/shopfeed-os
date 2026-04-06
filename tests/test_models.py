@@ -1,5 +1,5 @@
 """
-Tests for ml/training/dien.py and ml/training/bst.py
+Tests for ml/models/dien.py and ml/models/bst.py
 Covers BUG #11 (DIEN cand_proj) and BUG #15 (BST embed_dim%n_heads guard).
 """
 
@@ -9,8 +9,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from ml.training.dien import DIENModel
-from ml.training.bst import BSTModel
+from ml.models.dien import DIENModel
+from ml.models.bst import BSTModel
 
 
 # ──────────────────────────────────────────────────────────────

@@ -1,0 +1,49 @@
+# ============================================================
+# ShopFeed ML Monitoring & Drift Detection Configuration
+# ============================================================
+
+# ── Drift Detection (Evidently AI) ──────────────────────────
+drift:
+  reference_window_days: 7
+  check_interval_minutes: 60
+  features_to_monitor:
+    - price_normalized
+    - cv_quality_score
+    - freshness_decay
+    - click_rate
+    - purchase_rate
+    - category_distribution
+  statistical_test: ks        # ks | wasserstein | psi
+  drift_threshold: 0.05       # p-value threshold for KS test
+  alert_on_drift: true
+
+# ── Alerts ──────────────────────────────────────────────────
+alerts:
+  webhook_url: "${DRIFT_WEBHOOK_URL:-}"
+  slack_channel: "#ml-alerts"
+  email_recipients: []
+  severity_levels:
+    warning: 0.05    # Mild drift
+    critical: 0.01   # Severe drift → retrain
+
+# ── Model Performance Thresholds ────────────────────────────
+performance:
+  min_auc: 0.70
+  min_recall_at_10: 0.15
+  max_logloss: 0.65
+  staleness_hours: 72        # Alert if model not retrained in 72h
+
+# ── Fraud Detection ─────────────────────────────────────────
+fraud:
+  model: lightgbm
+  features:
+    - ip_request_rate
+    - session_duration
+    - click_pattern_entropy
+    - device_fingerprint_score
+    - geo_anomaly_score
+  threshold: 0.85
+  rules:
+    max_requests_per_minute: 60
+    min_session_duration_ms: 500
+    max_identical_actions: 10

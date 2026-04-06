@@ -36,39 +36,39 @@ def _load_model(model_name: str, checkpoint_path: str, config: dict[str, Any]) -
     Supports all model types in the shopfeed-os training pipeline.
     """
     if model_name == "two_tower":
-        from ml.training.two_tower import TwoTowerModel
+        from ml.models.two_tower import TwoTowerModel
         model = TwoTowerModel(
             user_input_dim=config.get("user_input_dim", 774),
             item_input_dim=config.get("item_input_dim", 1348),
             embedding_dim=config.get("embedding_dim", 256),
         )
     elif model_name == "deepfm":
-        from ml.training.deepfm import DeepFM
+        from ml.models.deepfm import DeepFM
         model = DeepFM(
             num_sparse_features=config.get("num_sparse_features", 1000),
             dense_input_dim=config.get("dense_input_dim", 512),
         )
     elif model_name == "mtl":
-        from ml.training.mtl_model import MTLModel
+        from ml.models.mtl_model import MTLModel
         model = MTLModel(
             input_dim=config.get("input_dim", 512),
         )
     elif model_name == "din":
-        from ml.training.din import DINModel
+        from ml.models.din import DINModel
         model = DINModel(
             n_items=config.get("n_items", 100000),
             n_categories=config.get("n_categories", 500),
             embed_dim=config.get("embed_dim", 64),
         )
     elif model_name == "dien":
-        from ml.training.dien import DIENModel
+        from ml.models.dien import DIENModel
         model = DIENModel(
             n_items=config.get("n_items", 100000),
             n_categories=config.get("n_categories", 500),
             embed_dim=config.get("embed_dim", 64),
         )
     elif model_name == "bst":
-        from ml.training.bst import BSTModel
+        from ml.models.bst import BSTModel
         model = BSTModel(
             n_items=config.get("n_items", 100000),
             n_categories=config.get("n_categories", 500),
@@ -277,15 +277,16 @@ def export_lightgbm_fraud(model_path: str, output_dir: str, config: dict) -> str
 
         booster = lgb.Booster(model_file=model_path)
         n_features = booster.num_feature()
+        opset = config.get("opset_version", 17)
 
         onnx_model = onnxmltools.convert_lightgbm(
             booster,
             initial_types=[("features", FloatTensorType([None, n_features]))],
-            target_opset=17,
+            target_opset=opset,
         )
 
         onnxmltools.utils.save_model(onnx_model, str(onnx_path))
-        logger.info("LightGBM fraud → ONNX: %s (%.2f MB)", onnx_path, onnx_path.stat().st_size / 1e6)
+        logger.info("LightGBM fraud → ONNX: %s (%.2f MB, opset=%d)", onnx_path, onnx_path.stat().st_size / 1e6, opset)
         return str(onnx_path)
 
     except ImportError as e:

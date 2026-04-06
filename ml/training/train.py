@@ -39,12 +39,12 @@ from ml.feature_store import (
     set_category_avg_prices,
     user_to_features,
 )
-from ml.training.deepfm import DeepFM
-from ml.training.mtl_model import MTLModel, TASK_NAMES, NUM_TASKS
-from ml.training.two_tower import TwoTowerModel
-from ml.training.din import DINModel, DINLoss
-from ml.training.dien import DIENModel, DIENLoss
-from ml.training.bst import BSTModel, BSTLoss
+from ml.models.deepfm import DeepFM
+from ml.models.mtl_model import MTLModel, TASK_NAMES, NUM_TASKS
+from ml.models.two_tower import TwoTowerModel
+from ml.models.din import DINModel, DINLoss
+from ml.models.dien import DIENModel, DIENLoss
+from ml.models.bst import BSTModel, BSTLoss
 
 # MLOps integrations (archi-2026 §9.6)
 try:
@@ -73,12 +73,13 @@ class TrainConfig:
 
     # Data
     data_path: str = "data/training_events.parquet"
-    val_split: float = 0.1
+    val_split: float = 0.10              # 10% validation
+    test_split: float = 0.10             # 10% test (held-out, never seen in training)
     num_workers: int = 4
     # BUG #5 FIX: temporal_split avoids data leakage for sequence models.
-    # When True, the last val_split% of samples (by index, which preserves
+    # When True, the last (val+test)% of samples (by index, which preserves
     # timestamp order from BehaviorSequenceDataset._preprocess()) is used
-    # as the validation set instead of a random shuffle.
+    # as the val/test sets instead of a random shuffle.
     # Must be True for DIN / DIEN / BST to avoid future interactions leaking
     # into the training set.
     temporal_split: bool = True
@@ -91,6 +92,7 @@ class TrainConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     mixed_precision: bool = True          # AMP for faster GPU training
+    early_stopping_patience: int = 5      # Stop after N epochs without val_loss improvement (0=disabled)
 
     # Two-Tower specific
     embedding_dim: int = 256
@@ -397,24 +399,29 @@ class Trainer:
             )
 
     def train(self, dataset: InteractionDataset) -> dict[str, float]:
-        """Full training loop.
+        """Full training loop with 80/10/10 split, early stopping, and history tracking.
+
+        Split: 80% train / 10% val / 10% test
+        - Val: used for early stopping & checkpoint selection during training
+        - Test: held-out, evaluated ONCE at the end (never influences training)
 
         Returns final metrics dict.
         """
-        # BUG #5 FIX: Use temporal split for sequence models to avoid data leakage.
-        # BehaviorSequenceDataset._preprocess() sorts by user→timestamp, so a
-        # simple index-based split preserves temporal ordering.
-        # random_split() would mix future interactions into the training set,
-        # giving artificially optimistic validation metrics.
+        # ── 80/10/10 Split ────────────────────────────────────
+        test_size = int(len(dataset) * self.config.test_split)
         val_size = int(len(dataset) * self.config.val_split)
-        train_size = len(dataset) - val_size
+        train_size = len(dataset) - val_size - test_size
+
         seq_models = ("din", "dien", "bst", "finetune")
         if self.config.temporal_split and self.config.model_name in seq_models:
+            # Temporal split: train → val → test (preserves time ordering)
             train_ds = Subset(dataset, range(0, train_size))
-            val_ds   = Subset(dataset, range(train_size, len(dataset)))
+            val_ds   = Subset(dataset, range(train_size, train_size + val_size))
+            test_ds  = Subset(dataset, range(train_size + val_size, len(dataset)))
             logger.info("Using TEMPORAL split (no shuffle) — avoids future-leakage in seq models")
         else:
-            train_ds, val_ds = random_split(dataset, [train_size, val_size])
+            # Random split for non-sequence models
+            train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
 
         train_loader = DataLoader(
             train_ds,
@@ -431,39 +438,103 @@ class Trainer:
             num_workers=self.config.num_workers,
             pin_memory=self.device.type == "cuda",
         )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=self.config.batch_size * 2,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.device.type == "cuda",
+        )
 
-        logger.info("Training: %d samples, Validation: %d samples", train_size, val_size)
+        logger.info(
+            "Split: Train=%d (%.0f%%) | Val=%d (%.0f%%) | Test=%d (%.0f%%)",
+            train_size, train_size / len(dataset) * 100,
+            val_size, val_size / len(dataset) * 100,
+            test_size, test_size / len(dataset) * 100,
+        )
+
+        # ── Training History (for learning curves) ────────────
+        history = {
+            "epochs": [],
+            "train_loss": [],
+            "val_loss": [],
+            "lr": [],
+        }
 
         final_metrics = {}
+        patience_counter = 0
 
         for epoch in range(self.config.epochs):
             # Train epoch
             train_loss = self._train_epoch(train_loader, epoch)
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             # Validate
             if (epoch + 1) % self.config.eval_interval == 0:
                 val_metrics = self._validate(val_loader)
                 final_metrics = val_metrics
+                val_loss = val_metrics.get("val_loss", train_loss)
+
+                # Record history
+                history["epochs"].append(epoch + 1)
+                history["train_loss"].append(round(train_loss, 6))
+                history["val_loss"].append(round(val_loss, 6))
+                history["lr"].append(current_lr)
+                # Add per-task AUCs to history
+                for k, v in val_metrics.items():
+                    if k.startswith("auc_") or k.startswith("logloss_"):
+                        history.setdefault(k, []).append(round(v, 6))
 
                 # Track and save best
-                val_loss = val_metrics.get("val_loss", train_loss)
                 if self.config.save_best and val_loss < self.best_metric:
                     self.best_metric = val_loss
+                    patience_counter = 0
                     self._save_checkpoint(epoch, is_best=True)
                     logger.info("★ New best model saved (val_loss=%.4f)", val_loss)
+                else:
+                    patience_counter += 1
 
                 logger.info(
-                    "Epoch %d/%d — train_loss=%.4f | %s",
+                    "Epoch %d/%d — train_loss=%.4f | %s | patience=%d/%d",
                     epoch + 1, self.config.epochs, train_loss,
                     " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()),
+                    patience_counter, self.config.early_stopping_patience,
                 )
+
+                # ── Early Stopping ────────────────────────────
+                if (
+                    self.config.early_stopping_patience > 0
+                    and patience_counter >= self.config.early_stopping_patience
+                ):
+                    logger.info(
+                        "⏹ Early stopping at epoch %d — val_loss did not improve for %d epochs",
+                        epoch + 1, patience_counter,
+                    )
+                    break
 
             # Step scheduler
             self.scheduler.step()
 
         # Save final model
-        self._save_checkpoint(self.config.epochs - 1, is_best=False)
+        self._save_checkpoint(epoch, is_best=False)
         logger.info("Training complete. Best val_loss=%.4f", self.best_metric)
+
+        # ── Save Training History (for learning curves) ───────
+        history_path = self.output_dir / "training_history.json"
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        logger.info("Training history saved: %s (%d epochs)", history_path, len(history["epochs"]))
+
+        # ── Test Set Evaluation (held-out, evaluated ONCE) ────
+        if test_size > 0:
+            logger.info("Evaluating on held-out test set (%d samples)...", test_size)
+            test_metrics = self._validate(test_loader)
+            test_metrics = {f"test_{k}": v for k, v in test_metrics.items()}
+            final_metrics.update(test_metrics)
+            logger.info(
+                "Test results: %s",
+                " | ".join(f"{k}={v:.4f}" for k, v in test_metrics.items()),
+            )
 
         # ── MLflow tracking (archi-2026 §9.6) ────────────────
         try:
@@ -479,8 +550,8 @@ class Trainer:
         except Exception as e:
             logger.warning("MLflow logging skipped: %s", e)
 
-        # Save metrics.json for Kubeflow validation gate
-        metrics_path = self.output_dir / "metrics.json"
+        # Save final metrics.json for Kubeflow validation gate
+        metrics_path = self.output_dir / "final_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(final_metrics, f, indent=2, default=str)
         logger.info("Metrics saved: %s", metrics_path)

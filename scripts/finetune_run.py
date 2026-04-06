@@ -98,12 +98,16 @@ def finetune_model(
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/max(total,1):.2f}%)")
 
-    # Loader de données propriétaires
+    # Loader de données propriétaires — REAL DATA ONLY, never mock
     try:
         from ml.datasets.loaders import ProprietaryInteractionsLoader
         loader = ProprietaryInteractionsLoader(batch_size=batch_size, model_type=model_name)
-    except Exception:
-        logger.warning("Proprietary loader not available. Using mock data.")
+    except FileNotFoundError as e:
+        logger.error("Fine-tuning data not found: %s", e)
+        logger.error("Run `python -m scripts.prepare_data --finetune` to prepare data first.")
+        return
+    except Exception as e:
+        logger.error("Failed to load fine-tuning data: %s", e)
         return
 
     optimizer = torch.optim.AdamW(

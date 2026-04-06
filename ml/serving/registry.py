@@ -59,7 +59,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
     """
     try:
         if name == "two_tower":
-            from ml.training.two_tower import TwoTowerModel
+            from ml.models.two_tower import TwoTowerModel
             return TwoTowerModel(
                 user_input_dim=cfg.get("user_dim", 764),
                 item_input_dim=cfg.get("item_dim", 1348),
@@ -67,7 +67,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             )
 
         elif name == "deepfm":
-            from ml.training.deepfm import DeepFM
+            from ml.models.deepfm import DeepFM
             return DeepFM(
                 num_sparse_features=cfg.get("num_sparse_features", 5000),
                 dense_input_dim=cfg.get("item_dim", 1348),
@@ -75,7 +75,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             )
 
         elif name == "mtl":
-            from ml.training.mtl_model import MTLModel
+            from ml.models.mtl_model import MTLModel
             return MTLModel(
                 input_dim=cfg.get("user_dim", 764) + cfg.get("item_dim", 1348),
                 num_shared_experts=cfg.get("num_shared_experts", 4),
@@ -84,7 +84,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             )
 
         elif name == "din":
-            from ml.training.din import DINModel
+            from ml.models.din import DINModel
             return DINModel(
                 n_items=cfg.get("n_items", 1_000_000),
                 n_categories=cfg.get("n_categories", 500),
@@ -94,7 +94,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             )
 
         elif name == "dien":
-            from ml.training.dien import DIENModel
+            from ml.models.dien import DIENModel
             return DIENModel(
                 n_items=cfg.get("n_items", 1_000_000),
                 n_categories=cfg.get("n_categories", 500),
@@ -104,7 +104,7 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             )
 
         elif name == "bst":
-            from ml.training.bst import BSTModel
+            from ml.models.bst import BSTModel
             embed_dim = cfg.get("seq_embed_dim", 64)
             # Ensure n_heads divides embed_dim
             n_heads = cfg.get("n_heads", 8)
@@ -272,6 +272,29 @@ class ModelRegistry:
         falls back to popularity-based ranking.
         """
         if self._faiss_index is not None:
+            # Cold-start users: blend popularity with ANN for better diversity
+            if user_interaction_count < 5 and self._popularity_scores:
+                # Hybrid: 50% ANN + 50% popularity for cold-start
+                ann_k = top_k // 2
+                pop_k = top_k - ann_k
+                query = user_embedding.reshape(1, -1).astype(np.float32)
+                scores, indices = self._faiss_index.search(query, ann_k)
+                ann_results = [
+                    (self._item_ids[i], float(s))
+                    for s, i in zip(scores[0], indices[0])
+                    if 0 <= i < len(self._item_ids)
+                ]
+                pop_results = sorted(
+                    self._popularity_scores.items(), key=lambda x: x[1], reverse=True
+                )[:pop_k]
+                # Merge, dedup, re-sort
+                seen = {iid for iid, _ in ann_results}
+                for iid, s in pop_results:
+                    if iid not in seen:
+                        ann_results.append((iid, s * 0.8))  # Slight discount for popularity
+                ann_results.sort(key=lambda x: x[1], reverse=True)
+                return ann_results[:top_k]
+
             query = user_embedding.reshape(1, -1).astype(np.float32)
             scores, indices = self._faiss_index.search(query, top_k)
             return [
@@ -316,6 +339,10 @@ class ModelRegistry:
         sparse_val = feat_slice.abs().clamp(0.0, 1.0)
 
         scores = model.forward_scores(sparse_idx, sparse_val, item_features)
+        # Return only top_k scores to reduce downstream compute
+        if scores.size(0) > top_k:
+            top_scores, top_indices = torch.topk(scores.squeeze(), top_k)
+            return top_scores.cpu()
         return scores.cpu()
 
     # ── Step 3: Sequence Model Ranking ──────────────────────────

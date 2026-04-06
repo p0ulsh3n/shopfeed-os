@@ -263,6 +263,7 @@ class ContentModerator(nn.Module if HAS_TORCH else object):
                 product_title=product_title,
                 image_url=image_url,
                 moderation_scores=scores,
+                moderation_action=action,
                 flagged_reasons=[
                     cat for cat, score in scores.items()
                     if score >= HUMAN_REVIEW_THRESHOLD

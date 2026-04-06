@@ -158,12 +158,119 @@ def evaluate_model(
     return metrics
 
 
+# ── Post-Training Visualization ────────────────────────────────
+
+def generate_plots(all_metrics: list[dict], output_dir: str = "checkpoints") -> None:
+    """Generate post-training visualizations.
+
+    Plots:
+        1. Learning curves (train_loss vs val_loss per epoch)
+        2. Model comparison (AUC/NDCG bar chart)
+        3. ROC curves (if y_true/y_scores available)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # Non-interactive backend for servers
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed — skipping plots. pip install matplotlib")
+        return
+
+    from pathlib import Path
+
+    plots_dir = Path(output_dir) / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Learning Curves ─────────────────────────────────────
+    for m in all_metrics:
+        model_name = m["model"]
+        history_path = Path(output_dir) / model_name / "training_history.json"
+        if not history_path.exists():
+            continue
+
+        import json as _json
+        with open(history_path) as f:
+            history = _json.load(f)
+
+        if not history.get("epochs"):
+            continue
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Loss curves
+        axes[0].plot(history["epochs"], history["train_loss"], "b-", linewidth=2, label="Train Loss")
+        axes[0].plot(history["epochs"], history["val_loss"], "r-", linewidth=2, label="Val Loss")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].set_title(f"{model_name} — Learning Curves")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # AUC curves (if available)
+        auc_keys = [k for k in history if k.startswith("auc_")]
+        if auc_keys:
+            for k in auc_keys:
+                axes[1].plot(history["epochs"], history[k], linewidth=2, label=k)
+            axes[1].set_xlabel("Epoch")
+            axes[1].set_ylabel("AUC")
+            axes[1].set_title(f"{model_name} — AUC per Task")
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+        else:
+            axes[1].text(0.5, 0.5, "No AUC data", ha="center", va="center")
+            axes[1].set_title(f"{model_name} — No AUC Data")
+
+        plt.tight_layout()
+        path = plots_dir / f"learning_curves_{model_name}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  Plot saved: {path}")
+
+    # ── 2. Model Comparison ────────────────────────────────────
+    models_with_auc = [m for m in all_metrics if m.get("auc_roc", 0) > 0]
+    if models_with_auc:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        names = [m["model"] for m in models_with_auc]
+        aucs = [m["auc_roc"] for m in models_with_auc]
+        ndcgs = [m.get("ndcg_at_10", 0) for m in models_with_auc]
+
+        # AUC comparison
+        bars = axes[0].barh(names, aucs, color="steelblue", alpha=0.8)
+        axes[0].set_xlabel("AUC-ROC")
+        axes[0].set_title("Model Comparison — AUC-ROC")
+        axes[0].set_xlim(0, 1)
+        axes[0].grid(True, alpha=0.3, axis="x")
+        for bar, val in zip(bars, aucs):
+            axes[0].text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                         f"{val:.4f}", va="center", fontsize=10)
+
+        # NDCG comparison
+        bars = axes[1].barh(names, ndcgs, color="coral", alpha=0.8)
+        axes[1].set_xlabel("NDCG@10")
+        axes[1].set_title("Model Comparison — NDCG@10")
+        axes[1].set_xlim(0, 1)
+        axes[1].grid(True, alpha=0.3, axis="x")
+        for bar, val in zip(bars, ndcgs):
+            axes[1].text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                         f"{val:.4f}", va="center", fontsize=10)
+
+        plt.tight_layout()
+        path = plots_dir / "model_comparison.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  Plot saved: {path}")
+
+    logger.info(f"All plots saved to: {plots_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Offline model evaluation")
     parser.add_argument("--model", default="all",
                         choices=["two_tower", "mtl_ple", "din", "dien", "bst", "deepfm", "all"])
     parser.add_argument("--split", default="test", choices=["val", "test"])
     parser.add_argument("--output_csv", default="eval_results.csv")
+    parser.add_argument("--no-plots", action="store_true", help="Skip plot generation")
     args = parser.parse_args()
 
     models = (
@@ -182,6 +289,12 @@ def main():
             writer.writerows(all_metrics)
         logger.info(f"Results saved to {args.output_csv}")
 
+    # Generate plots
+    if not args.no_plots and all_metrics:
+        logger.info("Generating post-training visualizations...")
+        generate_plots(all_metrics)
+
 
 if __name__ == "__main__":
     main()
+

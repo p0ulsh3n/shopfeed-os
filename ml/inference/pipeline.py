@@ -69,7 +69,9 @@ class RankingPipeline:
         item_ids, _ = await loop.run_in_executor(
             None, lambda: self.faiss_index.search(query, k)
         )
-        return [str(iid) for iid in item_ids[0] if iid != -1]
+        candidates = [str(iid) for iid in item_ids[0] if iid != -1]
+        logger.debug("Retrieved %d candidates for user=%s", len(candidates), user_id)
+        return candidates
 
     # ─── Étape 2 : DeepFM pre-ranking (<20ms) ──────────────────────────────
 

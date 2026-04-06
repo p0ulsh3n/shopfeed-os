@@ -367,6 +367,7 @@ class EpsilonEngine:
             return await generate_ad_copy(
                 product_title=product_title,
                 product_description=product_description,
+                product_image_url=product_image_url,
                 target_audience=target_audience,
                 vendor_name=vendor_name,
                 num_variants=num_variants,

@@ -1,0 +1,35 @@
+# ============================================================
+# ShopFeed Spark Batch Processing Configuration
+# ============================================================
+
+spark:
+  master: "${SPARK_MASTER:-k8s://https://kubernetes.default.svc}"
+  app_name: shopfeed-ml-pipeline
+  driver_memory: 8g
+  executor_memory: 16g
+  executor_cores: 4
+  executor_instances: 4
+  max_result_size: 4g
+  
+  # Delta Lake
+  delta:
+    extensions: io.delta.sql.DeltaSparkSessionExtension
+    catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
+  
+  # Shuffle & Partitioning
+  shuffle_partitions: 200
+  adaptive_enabled: true
+  coalesce_partitions: true
+  
+  # Kubernetes
+  kubernetes:
+    container_image: "${SPARK_IMAGE:-shopfeed/spark:4.0}"
+    namespace: "${SPARK_NAMESPACE:-ml-jobs}"
+    
+  # Data paths
+  paths:
+    raw_interactions: "s3a://shopfeed-data/raw/interactions/"
+    processed_features: "s3a://shopfeed-data/processed/features/"
+    user_embeddings: "s3a://shopfeed-data/embeddings/users/"
+    item_embeddings: "s3a://shopfeed-data/embeddings/items/"
+    training_output: "s3a://shopfeed-data/training/"

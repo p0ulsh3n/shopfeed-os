@@ -63,12 +63,10 @@ class FaissIndex:
         self._item_ids: list[str] = []  # mapping int64 faiss idx → item_id str
 
     def _build_index(self) -> "faiss.Index":
-        """Construit un index HNSW + PQ pour cosine similarity."""
+        """Construit un index HNSW pour cosine similarity."""
         if not FAISS_AVAILABLE:
             raise RuntimeError("faiss not installed")
-        # Flat inner product (après normalisation L2 = cosine)
-        base_index = faiss.IndexFlatIP(self.dim)
-        # Wrapper HNSW pour ANN
+        # HNSW graph index with flat storage (L2-normalized → inner product = cosine)
         index = faiss.IndexHNSWFlat(self.dim, self.m)
         index.hnsw.efConstruction = self.ef_construction
         index.hnsw.efSearch = self.ef_search

@@ -19,6 +19,7 @@ Blueprint: Section 41 — FLIP (Netflix 2024), Transfer Learning, LoRA PEFT
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -103,7 +104,10 @@ class LoRALinear(nn.Module):
             self.original.bias.requires_grad = False
 
         # LoRA decomposition matrices (trainable)
-        self.lora_A = nn.Parameter(torch.randn(rank, d_in) * 0.01)
+        # 2026 best practice: A = Kaiming uniform (preserves variance),
+        # B = zeros (initial adapter output = 0, starts from pretrained model)
+        self.lora_A = nn.Parameter(torch.empty(rank, d_in))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 

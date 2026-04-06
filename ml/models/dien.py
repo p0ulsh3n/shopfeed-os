@@ -102,11 +102,14 @@ class InterestExtractor(nn.Module):
         mask: torch.Tensor | None = None,  # [B, T]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (hidden_states [B, T, H], auxiliary_logits [B, T-1, 1])."""
-        # Pack padded sequence for efficient GRU
+        # GRU over behavior sequence
         hidden_states, _ = self.gru(behavior_emb)  # [B, T, H]
 
+        # Mask padded positions: zero out hidden states where mask=False
+        if mask is not None:
+            hidden_states = hidden_states * mask.unsqueeze(-1).float()  # [B, T, H]
+
         # Auxiliary loss: for each timestep t, predict if behavior t+1 was clicked
-        # Uses hidden state at t to predict about t+1
         aux_logits = self.auxiliary_net(hidden_states[:, :-1, :])  # [B, T-1, 1]
 
         return hidden_states, aux_logits
@@ -233,7 +236,9 @@ class DIENModel(nn.Module):
         category_emb = self.category_embedding(candidate_cat)
 
         # Stage 1: Interest Extractor (GRU + aux loss)
-        hidden_states, aux_logits = self.interest_extractor(behavior_emb)  # [B, T, H]
+        hidden_states, aux_logits = self.interest_extractor(
+            behavior_emb, mask=behavior_mask,
+        )  # [B, T, H]
 
         # Attention scores for AUGRU (candidate-aware per timestep)
         # BUG #11 FIX: use the registered nn.Linear / nn.Identity projection
@@ -241,6 +246,10 @@ class DIENModel(nn.Module):
         cand_proj = self.cand_proj(candidate_emb)  # [B, hidden_size]
 
         attention_scores = self._compute_attention(hidden_states, cand_proj)  # [B, T]
+
+        # Mask attention on padded positions (set to -inf before softmax)
+        if behavior_mask is not None:
+            attention_scores = attention_scores.masked_fill(~behavior_mask, -1e9)
 
         # Stage 2: Interest Evolution (AUGRU)
         evolved_interest = self.augru(hidden_states, attention_scores)  # [B, H]

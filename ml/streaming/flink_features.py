@@ -128,7 +128,12 @@ class FlinkFeaturePipeline:
             return None
 
     def create_redis_sink(self, table_name: str, key_field: str) -> Optional[str]:
-        """Create a Flink SQL sink writing to Redis."""
+        """Create a Flink SQL sink writing to Redis.
+
+        Args:
+            table_name: Base name for the sink table
+            key_field: Field name to use as Redis key (e.g., 'user_id', 'item_id')
+        """
         if not self.table_env:
             return None
 
@@ -137,9 +142,9 @@ class FlinkFeaturePipeline:
 
         ddl = f"""
         CREATE TABLE {sink_name} (
-            key_id STRING,
+            {key_field} STRING,
             features MAP<STRING, DOUBLE>,
-            PRIMARY KEY (key_id) NOT ENFORCED
+            PRIMARY KEY ({key_field}) NOT ENFORCED
         ) WITH (
             'connector' = 'redis',
             'host' = '{redis_host}',

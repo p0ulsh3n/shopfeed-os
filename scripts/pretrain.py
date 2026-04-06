@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 def pretrain_two_tower(epochs: int, batch_size: int, output_dir: str) -> None:
     """Phase 1a: Two-Tower sur Alibaba UserBehavior."""
     logger.info("=== Phase 1a: Two-Tower Pre-training ===")
-    from ml.training.two_tower import TwoTowerModel
+    from ml.models.two_tower import TwoTowerModel
     from ml.datasets.loaders import AlibabaUserBehaviorLoader
 
     model = TwoTowerModel(user_input_dim=764, item_input_dim=1348)
@@ -78,9 +78,9 @@ def pretrain_two_tower(epochs: int, batch_size: int, output_dir: str) -> None:
 def pretrain_behavior_models(epochs: int, batch_size: int, output_dir: str) -> None:
     """Phase 1c: DIN/DIEN/BST sur séquences Alibaba UserBehavior."""
     logger.info("=== Phase 1c: DIN/DIEN/BST Pre-training ===")
-    from ml.training.din import DINModel
-    from ml.training.dien import DIENModel
-    from ml.training.bst import BSTModel
+    from ml.models.din import DINModel
+    from ml.models.dien import DIENModel
+    from ml.models.bst import BSTModel
     from ml.datasets.loaders import AlibabaSequenceLoader
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

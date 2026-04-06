@@ -260,9 +260,17 @@ class AdRanker:
         desire_strength = ad.get("desire_score", 0.0)
         desire_mult = 1.0 + desire_strength * 0.5
 
+        # User profile signals — cold-start dampening + category affinity
+        user_interactions = user_features.get("interaction_count", 0)
+        cold_start_factor = min(1.0, user_interactions / 20.0)  # Ramp up over 20 interactions
+        user_cat_prefs = user_features.get("category_preferences", {})
+        ad_category = str(ad.get("category_id", ""))
+        cat_affinity = user_cat_prefs.get(ad_category, 0.5) if user_cat_prefs else 0.5
+        user_mult = (0.5 + 0.5 * cold_start_factor) * (0.7 + 0.3 * cat_affinity)
+
         # Compute predictions
-        score.pCTR = min(0.15, base_ctr * relevance * intent_mult * c_mult * desire_mult)
-        score.pCVR = min(0.10, base_cvr * relevance * intent_mult * desire_mult)
+        score.pCTR = min(0.15, base_ctr * relevance * intent_mult * c_mult * desire_mult * user_mult)
+        score.pCVR = min(0.10, base_cvr * relevance * intent_mult * desire_mult * user_mult)
         score.pROAS = base_roas * relevance * intent_mult
         score.pStoreVisit = min(0.25, base_store_visit * relevance * intent_mult * 1.5)
 
