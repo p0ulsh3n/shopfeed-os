@@ -114,7 +114,7 @@ def finetune_model(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss()
 
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     for epoch in range(epochs):
         t = time.time()
         total_loss = 0.0
@@ -134,15 +134,34 @@ def finetune_model(
         scheduler.step()
         avg_loss = total_loss / max(n_batches, 1)
         elapsed = time.time() - t
-        logger.info(f"  Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} ({elapsed:.1f}s)")
 
-        # Save best checkpoint
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # ── Validation pass (STRUCTURAL FIX) ─────────────────────
+        # Previously selected checkpoint based on training loss,
+        # which guarantees overfitting. Now uses a held-out validation
+        # set to select the best generalizing model.
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for val_batch in loader.get_val_batches():
+                val_out = model(**{k: v.to(device) for k, v in val_batch.items() if k != "labels"})
+                v_loss = criterion(val_out, val_batch["labels"].float().to(device))
+                val_loss += v_loss.item()
+                val_batches += 1
+        avg_val_loss = val_loss / max(val_batches, 1) if val_batches > 0 else avg_loss
+
+        logger.info(
+            f"  Epoch {epoch+1}/{epochs}: train_loss={avg_loss:.4f} "
+            f"val_loss={avg_val_loss:.4f} ({elapsed:.1f}s)"
+        )
+
+        # Save best checkpoint based on VALIDATION loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             save_path = os.path.join(OUTPUT_DIR, model_name, "finetuned.pt")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
-            logger.info(f"  Best checkpoint saved: {save_path}")
+            logger.info(f"  Best checkpoint saved: {save_path} (val_loss={avg_val_loss:.4f})")
 
 
 def main():

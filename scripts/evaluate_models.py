@@ -38,7 +38,7 @@ def compute_recall_at_k(ranked_lists: list[list[str]], relevant_items: list[set]
         if not relevant:
             continue
         hits = sum(1 for item in ranked[:k] if item in relevant)
-        recalls.append(hits / min(len(relevant), k))
+        recalls.append(hits / len(relevant))
     return float(np.mean(recalls)) if recalls else 0.0
 
 

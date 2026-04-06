@@ -32,7 +32,7 @@ def pretrain_two_tower(epochs: int, batch_size: int, output_dir: str) -> None:
     from ml.training.two_tower import TwoTowerModel
     from ml.datasets.loaders import AlibabaUserBehaviorLoader
 
-    model = TwoTowerModel()
+    model = TwoTowerModel(user_input_dim=764, item_input_dim=1348)
     loader = AlibabaUserBehaviorLoader(batch_size=batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -88,7 +88,7 @@ def pretrain_behavior_models(epochs: int, batch_size: int, output_dir: str) -> N
 
     for ModelClass, name in [(DINModel, "din"), (DIENModel, "dien"), (BSTModel, "bst")]:
         logger.info(f"Pre-training {name.upper()}...")
-        model = ModelClass().to(device)
+        model = ModelClass(n_items=1_000_000, n_categories=500).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         criterion = nn.BCEWithLogitsLoss()
 

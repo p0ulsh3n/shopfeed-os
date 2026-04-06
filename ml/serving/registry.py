@@ -61,8 +61,8 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
         if name == "two_tower":
             from ml.training.two_tower import TwoTowerModel
             return TwoTowerModel(
-                user_dim=cfg.get("user_dim", 764),
-                item_dim=cfg.get("item_dim", 1348),
+                user_input_dim=cfg.get("user_dim", 764),
+                item_input_dim=cfg.get("item_dim", 1348),
                 embedding_dim=cfg.get("embedding_dim", 256),
             )
 
@@ -70,8 +70,8 @@ def _reconstruct_model(name: str, cfg: dict) -> nn.Module | None:
             from ml.training.deepfm import DeepFM
             return DeepFM(
                 num_sparse_features=cfg.get("num_sparse_features", 5000),
+                dense_input_dim=cfg.get("item_dim", 1348),
                 fm_embedding_dim=cfg.get("fm_embedding_dim", 16),
-                dense_dim=cfg.get("item_dim", 1348),
             )
 
         elif name == "mtl":

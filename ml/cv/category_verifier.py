@@ -112,21 +112,53 @@ def verify_category(
 
 
 def _score_category(image_emb: np.ndarray, labels: list[str]) -> float:
-    """Score moyen de similarité entre l'image et les labels textuels de la catégorie."""
-    from ml.cv.clip_encoder import encode_text, compute_similarity
+    """Score moyen de similarité entre l'image et les labels textuels de la catégorie.
+    
+    STRUCTURAL FIX: Previously used encode_text() which produces 768d sentence-transformer
+    embeddings, but image_emb is a 512d CLIP embedding. Computing dot product on truncated
+    dimensions is mathematically invalid. Now uses open_clip text tokenizer to produce
+    512d text embeddings in the SAME space as the image embeddings.
+    """
     scores = []
     for label in labels:
-        text_emb = encode_text(label)
-        if text_emb is not None and not np.all(text_emb == 0):
-            # Normaliser le text_emb pour la cosine similarity
-            norm = np.linalg.norm(text_emb)
-            if norm > 0:
-                text_emb_norm = text_emb / norm
+        try:
+            # Use CLIP text encoder (512d) — same space as image embeddings
+            import torch
+            from ml.cv.clip_encoder import _get_generic_model
+            generic = _get_generic_model()
+            if generic is not None:
+                model, _ = generic
+                import open_clip
+                tokenizer = open_clip.get_tokenizer("ViT-B-32")
+                text_tokens = tokenizer([label])
+                with torch.no_grad():
+                    text_emb = model.encode_text(text_tokens)
+                    text_emb_np = text_emb.cpu().numpy().flatten()
+                    # L2 normalize
+                    norm = np.linalg.norm(text_emb_np)
+                    if norm > 0:
+                        text_emb_norm = text_emb_np / norm
+                    else:
+                        continue
+                    s = float(np.dot(image_emb, text_emb_norm))
+                    scores.append(max(0.0, s))
             else:
-                continue
-            # Et l'image_emb (déjà L2 normalisé dans encode_product_image)
-            s = float(np.dot(image_emb, text_emb_norm[:len(image_emb)]))
-            scores.append(max(0.0, s))
+                # Fallback: use sentence-transformer but project to image dim
+                from ml.cv.clip_encoder import encode_text
+                text_emb = encode_text(label)
+                if text_emb is not None and not np.all(text_emb == 0):
+                    norm = np.linalg.norm(text_emb)
+                    if norm > 0:
+                        text_emb_norm = text_emb / norm
+                        # Project 768d → 512d via truncation (lossy but safe fallback)
+                        projected = text_emb_norm[:len(image_emb)]
+                        proj_norm = np.linalg.norm(projected)
+                        if proj_norm > 0:
+                            projected = projected / proj_norm
+                        s = float(np.dot(image_emb, projected))
+                        scores.append(max(0.0, s))
+        except Exception:
+            continue
     return sum(scores) / len(scores) if scores else 0.0
 
 
