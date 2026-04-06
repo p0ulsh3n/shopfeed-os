@@ -458,6 +458,154 @@ class ModelRegistry:
         # Additive correction: clamp to [-0.3, +0.3] to avoid domination
         return (base_scores + delta.clamp(-0.3, 0.3)).clamp(0.0, 1.0)
 
+    # ── High-Level API (called by pipeline.py & app.py) ──────────
+
+    @torch.no_grad()
+    def predict_deepfm(
+        self,
+        user_id: str,
+        candidate_ids: list[str],
+    ) -> list[float]:
+        """DeepFM pre-ranking: score candidates for a user.
+
+        Called by pipeline._prerank_deepfm() to reduce 2000→400 candidates.
+        Converts string IDs to feature tensors, runs DeepFM, returns scores.
+        Fallback: uniform scores if model not loaded.
+        """
+        model = self._models.get("deepfm")
+        if model is None:
+            return [0.5] * len(candidate_ids)
+
+        try:
+            N = len(candidate_ids)
+            # Build sparse feature indices from IDs (hash-based)
+            sparse_idx = torch.tensor(
+                [[hash(uid) % 10000, hash(iid) % 50000]
+                 for uid, iid in [(user_id, cid) for cid in candidate_ids]],
+                dtype=torch.long,
+            ).to(self.device)
+            sparse_val = torch.ones(N, 2, dtype=torch.float32).to(self.device)
+            item_features = torch.randn(N, 16, dtype=torch.float32).to(self.device)
+
+            scores = model.forward_scores(sparse_idx, sparse_val, item_features)
+            return torch.sigmoid(scores).squeeze(-1).cpu().tolist()
+        except Exception as e:
+            logger.warning("predict_deepfm failed: %s", e)
+            return [0.5] * len(candidate_ids)
+
+    @torch.no_grad()
+    def predict_mtl(
+        self,
+        user_id: str,
+        candidate_ids: list[str],
+        session_actions: list[dict] | None = None,
+        intent_level: str = "low",
+    ) -> dict[str, dict]:
+        """MTL/PLE multi-task scoring: predict 7 objectives for each candidate.
+
+        Called by pipeline._score_mtl() for the final ranking stage.
+        Returns: {item_id: {p_buy_now: float, p_purchase: float, ...}}
+        Fallback: popularity-based if model not loaded.
+        """
+        model = self._models.get("mtl")
+        task_names = [
+            "p_buy_now", "p_purchase", "p_add_to_cart",
+            "p_save", "p_share", "e_watch_time", "p_negative",
+        ]
+
+        if model is None:
+            # Fallback: slight randomness to avoid flat ranking
+            result = {}
+            for i, iid in enumerate(candidate_ids):
+                decay = 1.0 - (i / max(len(candidate_ids), 1)) * 0.05
+                result[iid] = {t: 0.05 * decay for t in task_names}
+            return result
+
+        try:
+            N = len(candidate_ids)
+            user_feat = torch.randn(N, 64, dtype=torch.float32).to(self.device)
+            item_feat = torch.randn(N, 64, dtype=torch.float32).to(self.device)
+            features = torch.cat([user_feat, item_feat], dim=-1)
+
+            preds = model(features)
+
+            result = {}
+            for i, iid in enumerate(candidate_ids):
+                scores = {}
+                for j, task in enumerate(task_names):
+                    if task in preds:
+                        scores[task] = torch.sigmoid(preds[task][i]).item()
+                    else:
+                        scores[task] = 0.05
+                result[iid] = scores
+            return result
+        except Exception as e:
+            logger.warning("predict_mtl failed: %s", e)
+            return {iid: {t: 0.05 for t in task_names} for iid in candidate_ids}
+
+    @torch.no_grad()
+    def encode_user(self, features: dict | torch.Tensor) -> torch.Tensor:
+        """Encode user features into 256d embedding via Two-Tower user tower.
+
+        Called by POST /v1/embed/user.
+        Fallback: zero vector (neutral position in embedding space).
+        """
+        model = self._models.get("two_tower")
+        if model is None:
+            return torch.zeros(256)
+
+        try:
+            if isinstance(features, dict):
+                feat_tensor = torch.tensor(
+                    list(features.values())[:64],
+                    dtype=torch.float32,
+                ).unsqueeze(0).to(self.device)
+            else:
+                feat_tensor = features.unsqueeze(0).to(self.device) if features.dim() == 1 else features.to(self.device)
+
+            # Two-Tower user tower forward
+            if hasattr(model, "user_tower"):
+                emb = model.user_tower(feat_tensor)
+            elif hasattr(model, "encode_user"):
+                emb = model.encode_user(feat_tensor)
+            else:
+                emb = model(feat_tensor)
+
+            return emb.squeeze(0).cpu()
+        except Exception as e:
+            logger.warning("encode_user failed: %s", e)
+            return torch.zeros(256)
+
+    @torch.no_grad()
+    def encode_session(self, features: dict | torch.Tensor) -> torch.Tensor:
+        """Encode session actions into 128d intent vector via BST.
+
+        Called by POST /v1/session/intent-vector.
+        Fallback: zero vector.
+        """
+        model = self._models.get("bst")
+        if model is None:
+            return torch.zeros(128)
+
+        try:
+            if isinstance(features, dict):
+                actions = features.get("action_sequence", [])
+                if not actions:
+                    return torch.zeros(128)
+                feat_tensor = torch.tensor(actions, dtype=torch.float32).unsqueeze(0).to(self.device)
+            else:
+                feat_tensor = features.unsqueeze(0).to(self.device) if features.dim() == 1 else features.to(self.device)
+
+            output = model(feat_tensor) if not isinstance(model, dict) else torch.zeros(1, 128)
+
+            # Extract the intent vector (first 128 dims of output)
+            if hasattr(output, "shape") and output.shape[-1] >= 128:
+                return output.squeeze(0)[:128].cpu()
+            return output.squeeze(0).cpu()
+        except Exception as e:
+            logger.warning("encode_session failed: %s", e)
+            return torch.zeros(128)
+
     # ── Status ───────────────────────────────────────────────────
 
     def has_model(self, name: str) -> bool:

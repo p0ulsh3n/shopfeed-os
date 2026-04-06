@@ -160,3 +160,61 @@ class RedisFeatureStore:
             await pipe.execute()
         logger.info("Synced %d embeddings from Cuckoo table → Redis", count)
         return count
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Module-level convenience functions — called by ml/inference/app.py
+# ═════════════════════════════════════════════════════════════════════════════
+# These are synchronous wrappers that create a temporary store connection.
+# In production, the singleton store is injected via FastAPI lifespan.
+
+_default_store: RedisFeatureStore | None = None
+
+
+def _get_store() -> RedisFeatureStore:
+    """Get or create the default Redis store singleton."""
+    global _default_store
+    if _default_store is None:
+        import os
+        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _default_store = RedisFeatureStore(redis_url=url)
+    return _default_store
+
+
+def cache_user_features(user_id: str, embedding: list[float]) -> None:
+    """Cache user embedding (256d) in Redis.
+
+    Called by POST /v1/embed/user after Two-Tower computation.
+    Key: shopfeed:user:emb:{user_id}  TTL: 3600s (1h)
+    """
+    import asyncio
+    store = _get_store()
+    try:
+        tensor = torch.tensor(embedding, dtype=torch.float32)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(store.connect())
+        loop.run_until_complete(store.set_user_embedding(user_id, tensor))
+        loop.close()
+    except Exception as e:
+        logger.warning("cache_user_features failed for %s: %s", user_id, e)
+
+
+def cache_session_intent(session_id: str, vector: list[float]) -> None:
+    """Cache session intent vector (128d) in Redis.
+
+    Called by POST /v1/session/intent-vector after BST encoding.
+    Key: shopfeed:session:intent:{session_id}  TTL: 1800s (30min)
+    """
+    import asyncio
+    store = _get_store()
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(store.connect())
+        if store._redis is not None:
+            key = store._key("session", "intent", session_id)
+            data = torch.tensor(vector, dtype=torch.float32).numpy().tobytes()
+            loop.run_until_complete(store._redis.set(key, data, ex=1800))
+        loop.close()
+    except Exception as e:
+        logger.warning("cache_session_intent failed for %s: %s", session_id, e)
+

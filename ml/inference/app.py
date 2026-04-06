@@ -2,13 +2,23 @@
 ShopFeed-OS ML Inference API — FastAPI Application
 Port 8100 — appelé par shop-backend/shared/infrastructure/ml_client.py
 
-6 endpoints HTTP synchrones:
-  POST /v1/feed/rank              ← SLA <80ms
+Feed Endpoints (3 context-specific + 1 generic):
+  POST /v1/feed/scroll             ← Feed scroll infini (TikTok)    SLA <80ms
+  POST /v1/feed/marketplace        ← Marketplace product grid       SLA <80ms
+  POST /v1/feed/live               ← Live shopping carousel         SLA <50ms
+  POST /v1/feed/rank               ← Generic (backward-compat)
+
+Other:
   POST /v1/embed/user
   POST /v1/embed/product
-  POST /v1/session/intent-vector  ← SLA <100ms
+  POST /v1/session/intent-vector   ← SLA <100ms
   POST /v1/moderation/clip-check
   GET  /v1/health
+
+Architecture:
+  Les 3 feed endpoints partagent le MÊME pipeline ML (pipeline.py)
+  mais retournent des réponses structurées différemment.
+  Les données temps réel (session_vector, interactions Redis) sont partagées.
 """
 
 from __future__ import annotations
@@ -22,7 +32,11 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 
 from ml.inference.schemas import (
-    RankRequest, RankResponse,
+    RankRequest, RankResponse, RankedCandidate,
+    ScrollFeedItem, ScrollFeedResponse, ScrollEngagement,
+    MarketplaceProductItem, MarketplaceFeedResponse, MarketplaceSocialProof,
+    LiveProductItem, LiveFeedResponse, LiveUrgency,
+    MTLScores, DiversityFlags,
     EmbedUserRequest, EmbedUserResponse,
     EmbedProductRequest, EmbedProductResponse,
     IntentVectorRequest, IntentVectorResponse,
@@ -31,6 +45,11 @@ from ml.inference.schemas import (
     VendorInsightsRequest, VendorInsightsResponse,
     AdCopyRequest, AdCopyResponse, AdCopyVariant,
     HealthResponse,
+    AdServeRequest, AdServeResponse, ServedAd,
+    FraudCheckRequest, FraudCheckResponse,
+    TranscribeRequest, TranscribeResponse, TranscribedEntity,
+    DuplicateCheckRequest, DuplicateCheckResponse, DuplicateMatch,
+    EmbedVideoRequest, EmbedVideoResponse,
 )
 from ml.inference.health import get_health
 from ml.inference.pipeline import RankingPipeline
@@ -127,6 +146,151 @@ async def feed_rank(
     6. Cross-sell injection si buy_now trigger
     """
     return await pipeline.rank(request)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 1b — POST /v1/feed/scroll  ⚡ SLA <80ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/feed/scroll",
+    response_model=ScrollFeedResponse,
+    summary="Feed scroll infini — engagement-first ranking",
+    tags=["Feed"],
+)
+async def feed_scroll(
+    request: RankRequest,
+    pipeline: RankingPipeline = Depends(get_pipeline),
+) -> ScrollFeedResponse:
+    """TikTok-style vertical scroll feed.
+
+    Optimisé pour l'engagement (watch_time, share, save).
+    Retourne des items enrichis avec media URLs et compteurs engagement.
+    Partage les mêmes données temps réel que le marketplace.
+    """
+    # Force context=feed
+    request.context = "feed"
+    rank_result = await pipeline.rank(request)
+
+    # Transform generic RankResponse → ScrollFeedResponse
+    items = []
+    for i, c in enumerate(rank_result.candidates):
+        items.append(ScrollFeedItem(
+            item_id=c.item_id,
+            rank=i + 1,
+            score=c.score,
+            pool_level=c.pool_level,
+            mtl_scores=c.mtl_scores,
+            diversity_flags=c.diversity_flags,
+            engagement=ScrollEngagement(),  # Enriched by shop-backend from Redis
+            reason="personalized" if not c.diversity_flags.is_new_vendor else "discovery",
+        ))
+
+    return ScrollFeedResponse(
+        items=items,
+        total_candidates=len(rank_result.candidates),
+        has_more=len(items) >= request.limit,
+        pipeline_ms=rank_result.pipeline_ms,
+        context="feed",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 1c — POST /v1/feed/marketplace  ⚡ SLA <80ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/feed/marketplace",
+    response_model=MarketplaceFeedResponse,
+    summary="Marketplace product grid — conversion-first ranking",
+    tags=["Feed"],
+)
+async def feed_marketplace(
+    request: RankRequest,
+    pipeline: RankingPipeline = Depends(get_pipeline),
+) -> MarketplaceFeedResponse:
+    """E-commerce product grid feed.
+
+    Optimisé pour la conversion (purchase, add_to_cart) + addiction par la variété.
+    Retourne des items enrichis avec pricing, badges, social proof, cross-sell.
+    Partage les mêmes données temps réel que le feed scroll.
+    """
+    # Force context=marketplace
+    request.context = "marketplace"
+    rank_result = await pipeline.rank(request)
+
+    items = []
+    prices = []
+    for i, c in enumerate(rank_result.candidates):
+        meta = c.mtl_scores
+        is_cross = c.diversity_flags.is_cold_start  # placeholder flag for cross-sell
+
+        item = MarketplaceProductItem(
+            item_id=c.item_id,
+            rank=i + 1,
+            score=c.score,
+            price=0.0,  # Enriched by shop-backend from catalog DB
+            pool_level=c.pool_level,
+            mtl_scores=c.mtl_scores,
+            diversity_flags=c.diversity_flags,
+            social_proof=MarketplaceSocialProof(),  # Enriched by shop-backend
+            badges=[],  # Enriched by shop-backend
+            is_cross_sell=is_cross,
+            reason="personalized" if not c.diversity_flags.is_new_vendor else "discovery",
+        )
+        items.append(item)
+
+    return MarketplaceFeedResponse(
+        items=items,
+        total_candidates=len(rank_result.candidates),
+        has_more=len(items) >= request.limit,
+        pipeline_ms=rank_result.pipeline_ms,
+        context="marketplace",
+        sort_mode="relevance",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 1d — POST /v1/feed/live  ⚡ SLA <50ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/feed/live",
+    response_model=LiveFeedResponse,
+    summary="Live shopping carousel — urgency-first ranking",
+    tags=["Feed"],
+)
+async def feed_live(
+    request: RankRequest,
+    pipeline: RankingPipeline = Depends(get_pipeline),
+) -> LiveFeedResponse:
+    """Live shopping product carousel.
+
+    Optimisé pour l'urgence (buy_now, FOMO).
+    Retourne des items avec signaux d'urgence (stock, countdown, viewers).
+    SLA plus serré (<50ms) car affiché pendant un live stream.
+    """
+    # Force context=live
+    request.context = "live"
+    rank_result = await pipeline.rank(request)
+
+    items = []
+    for i, c in enumerate(rank_result.candidates):
+        items.append(LiveProductItem(
+            item_id=c.item_id,
+            rank=i + 1,
+            score=c.score,
+            price=0.0,  # Enriched by shop-backend
+            pool_level=c.pool_level,
+            mtl_scores=c.mtl_scores,
+            urgency=LiveUrgency(),  # Enriched by shop-backend from live session
+        ))
+
+    return LiveFeedResponse(
+        items=items,
+        pipeline_ms=rank_result.pipeline_ms,
+        context="live",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -560,6 +724,227 @@ async def llm_generate_ad_copy(
 )
 async def health(registry=Depends(get_registry)) -> HealthResponse:
     return await get_health(registry)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 10 — POST /v1/ads/serve  ⚡ SLA <12ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/ads/serve",
+    response_model=AdServeResponse,
+    summary="EPSILON ad pipeline — targeting → retrieval → ranking → auction",
+    tags=["Ads"],
+)
+async def ads_serve(request: AdServeRequest) -> AdServeResponse:
+    """EPSILON 6-stage ad serving pipeline.
+
+    1. Audience matching (<2ms)
+    2. Multi-modal retrieval (<3ms)
+    3. Ad ranking pCTR×pCVR×pROAS (<3ms)
+    4. Uplift filtering (<1ms)
+    5. GSP auction + fatigue (<2ms)
+    6. Placement in organic feed (<1ms)
+    """
+    t_start = time.perf_counter()
+    try:
+        from ml.ads.epsilon import EpsilonEngine, EpsilonRequest as EpsReq
+        engine = EpsilonEngine()
+        eps_request = EpsReq(
+            user_id=request.user_id,
+            session_vector=request.session_vector,
+            organic_items=request.feed_items,
+            placement_slots=request.placement_slots,
+            context=request.context,
+        )
+        result = await engine.serve(eps_request)
+        pipeline_ms = (time.perf_counter() - t_start) * 1000
+        return AdServeResponse(
+            ads=[ServedAd(**ad) for ad in result.get("ads", [])],
+            total_eligible=result.get("total_eligible", 0),
+            pipeline_ms=pipeline_ms,
+        )
+    except Exception as e:
+        logger.error(f"EPSILON ad serve failed: {e}")
+        return AdServeResponse(pipeline_ms=(time.perf_counter() - t_start) * 1000)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 11 — POST /v1/fraud/check  ⚡ SLA <20ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/fraud/check",
+    response_model=FraudCheckResponse,
+    summary="LightGBM fraud detection — bots, fake engagement, card fraud",
+    tags=["Moderation"],
+)
+async def fraud_check(request: FraudCheckRequest) -> FraudCheckResponse:
+    """Real-time fraud scoring via LightGBM + velocity rules.
+
+    Score > 0.9 → shadowban + investigation
+    Score > 0.7 → captcha challenge
+    Score < 0.3 → allow
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        from ml.fraud.detector import FraudDetector
+        detector = FraudDetector()
+        result = await loop.run_in_executor(
+            None,
+            lambda: detector.check(
+                user_id=request.user_id,
+                action=request.action,
+                ip_address=request.ip_address,
+                device_fingerprint=request.device_fingerprint,
+                session_duration_s=request.session_duration_s,
+                actions_last_hour=request.actions_last_hour,
+                metadata=request.metadata,
+            ),
+        )
+        return FraudCheckResponse(
+            fraud_score=result.get("score", 0.0),
+            decision=result.get("decision", "allow"),
+            risk_factors=result.get("risk_factors", []),
+            is_bot=result.get("is_bot", False),
+            is_emulator=result.get("is_emulator", False),
+            velocity_alert=result.get("velocity_alert", False),
+        )
+    except Exception as e:
+        logger.error(f"Fraud check failed: {e}")
+        return FraudCheckResponse(fraud_score=0.0, decision="allow")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 12 — POST /v1/audio/transcribe  (async, heavy GPU)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/audio/transcribe",
+    response_model=TranscribeResponse,
+    summary="Whisper audio transcription + entity extraction",
+    tags=["Audio"],
+)
+async def audio_transcribe(request: TranscribeRequest) -> TranscribeResponse:
+    """Transcribe vendor video/live audio via Whisper large-v3.
+
+    Extracts products, brands, prices, urgency cues from speech.
+    Triggered after vendor video upload or live stream end.
+    """
+    t_start = time.perf_counter()
+    try:
+        from ml.audio.whisper_transcriber import transcribe, extract_entities
+        result = await transcribe(request.audio_url, request.language)
+
+        entities = []
+        if request.extract_entities and result.get("transcript"):
+            raw_entities = extract_entities(result["transcript"])
+            entities = [TranscribedEntity(**e) for e in raw_entities]
+
+        return TranscribeResponse(
+            transcript=result.get("transcript", ""),
+            language=result.get("language", ""),
+            duration_s=result.get("duration_s", 0.0),
+            entities=entities,
+            word_count=len(result.get("transcript", "").split()),
+            pipeline_ms=(time.perf_counter() - t_start) * 1000,
+        )
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        return TranscribeResponse(pipeline_ms=(time.perf_counter() - t_start) * 1000)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 13 — POST /v1/moderation/duplicate-check
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/moderation/duplicate-check",
+    response_model=DuplicateCheckResponse,
+    summary="Detect duplicate product images via perceptual hash",
+    tags=["Moderation"],
+)
+async def moderation_duplicate_check(
+    request: DuplicateCheckRequest,
+) -> DuplicateCheckResponse:
+    """Check if a product image is a duplicate.
+
+    Uses perceptual hashing (pHash). Hamming distance ≤ 8 = duplicate.
+    """
+    t_start = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    try:
+        from ml.cv.duplicate_detector import compute_phash, find_duplicates_in_batch
+        phash = await loop.run_in_executor(
+            None, lambda: compute_phash(request.image_url)
+        )
+        if phash is None:
+            return DuplicateCheckResponse(
+                pipeline_ms=(time.perf_counter() - t_start) * 1000
+            )
+
+        matches_raw = await loop.run_in_executor(
+            None,
+            lambda: find_duplicates_in_batch(
+                phash, scope=request.check_scope, vendor_id=request.vendor_id
+            ),
+        )
+        matches = [DuplicateMatch(**m) for m in (matches_raw or [])]
+
+        return DuplicateCheckResponse(
+            is_duplicate=len(matches) > 0,
+            matches=matches,
+            phash=phash,
+            pipeline_ms=(time.perf_counter() - t_start) * 1000,
+        )
+    except Exception as e:
+        logger.error(f"Duplicate check failed: {e}")
+        return DuplicateCheckResponse(
+            pipeline_ms=(time.perf_counter() - t_start) * 1000
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoint 14 — POST /v1/embed/video
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/v1/embed/video",
+    response_model=EmbedVideoResponse,
+    summary="VideoMAE spatio-temporal video embedding (768d)",
+    tags=["Embeddings"],
+)
+async def embed_video(request: EmbedVideoRequest) -> EmbedVideoResponse:
+    """Extract 768d temporal video embedding via VideoMAE.
+
+    Captures motion patterns (unboxing, demos) that frame-by-frame
+    CLIP cannot see. Used for video similarity in feed scroll ranking.
+    """
+    t_start = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    try:
+        from ml.cv.videomae_encoder import VideoMAEEncoder
+        encoder = VideoMAEEncoder()
+        result = await loop.run_in_executor(
+            None,
+            lambda: encoder.encode(request.video_url, n_frames=request.n_frames),
+        )
+        embedding = result.get("embedding", [])
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
+
+        return EmbedVideoResponse(
+            embedding=embedding,
+            duration_s=result.get("duration_s", 0.0),
+            content_type=result.get("content_type", ""),
+            pipeline_ms=(time.perf_counter() - t_start) * 1000,
+        )
+    except Exception as e:
+        logger.error(f"Video embed failed: {e}")
+        return EmbedVideoResponse(
+            embedding=np.zeros(768).tolist(),
+            pipeline_ms=(time.perf_counter() - t_start) * 1000,
+        )
 
 
 # ── Exception handlers ───────────────────────────────────────────────────────
