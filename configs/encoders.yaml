@@ -1,0 +1,84 @@
+# ============================================================
+# ShopFeed ML — Visual Encoder Configuration
+# ============================================================
+# Choisir le bon modèle visuel selon le domaine de la marketplace.
+#
+# ShopFeed est une marketplace GÉNÉRALISTE (mode, électronique,
+# alimentation, beauté, maison, auto, sport, bébé…). Le visual
+# encoder doit être adapté au catalogue dominant.
+#
+# DOMAINES SUPPORTÉS
+# ──────────────────
+# generic      → CLIP ViT-L-14 (OpenAI) ou SigLIP générique
+#                Idéal pour catalogues mixtes ou inconnus
+# fashion      → Marqo/marqo-fashionSigLIP (+22% recall@1 sur textiles)
+#                Utiliser seulement si >70% du catalogue est mode/vêtements
+# electronics  → openai/clip-vit-large-patch14 + fine-tuning produit
+#                (SigLIP générique acceptable, pas de modèle spécialisé mainstream)
+# food         → openai/clip-vit-base-patch32 (bon sur nourriture/FMCG)
+#                Alternative: Salesforce/BLIP-2-opt-2.7b pour captioning
+#
+# RECOMMANDATION 2026 pour marketplace généraliste:
+#   Utiliser ViT-L-14 générique (domain-agnostic) jusqu'à ce qu'une
+#   catégorie représente >70% du GMV, puis fine-tuner sur cette catégorie.
+# ============================================================
+
+visual_encoder:
+  # Domaine principal de la marketplace
+  # Options: generic | fashion | electronics | food | beauty | auto
+  domain: "${VISUAL_ENCODER_DOMAIN:-generic}"
+
+  # Modèles par domaine (configurable sans recompilation)
+  models:
+    generic:
+      primary: "${VISUAL_MODEL_GENERIC:-hf-hub:laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K}"
+      fallback: "ViT-B-16-SigLIP"
+      pretrained_fallback: "webli"
+      description: "CLIP ViT-L-14 DataComp (LAION) — meilleur modèle généraliste 2026, +9% 0-shot vs OpenAI CLIP"
+
+    fashion:
+      primary: "${VISUAL_MODEL_FASHION:-hf-hub:Marqo/marqo-fashionSigLIP}"
+      fallback: "hf-hub:patrickjohncyh/fashion-clip"
+      description: "Marqo-FashionSigLIP — fine-tuné sur données mode, +22% recall@1 texte→image"
+
+    electronics:
+      primary: "${VISUAL_MODEL_ELECTRONICS:-ViT-L-14}"
+      pretrained: "openai"
+      description: "CLIP ViT-L-14 OpenAI — bon généraliste pour produits tech"
+
+    food:
+      primary: "${VISUAL_MODEL_FOOD:-ViT-B-32}"
+      pretrained: "openai"
+      description: "CLIP ViT-B-32 — performant sur FMCG / alimentation"
+
+    beauty:
+      primary: "${VISUAL_MODEL_BEAUTY:-hf-hub:laion/CLIP-ViT-B-32-laion2B-s34B-b79K}"
+      description: "CLIP LAION-2B — bon pour beauté/cosmétiques"
+
+    auto:
+      primary: "${VISUAL_MODEL_AUTO:-ViT-L-14}"
+      pretrained: "openai"
+      description: "CLIP ViT-L-14 OpenAI"
+
+  # Dimensions de sortie des encodeurs visuels
+  output_dims:
+    ViT-L-14: 768
+    ViT-B-16-SigLIP: 512
+    ViT-B-32: 512
+    marqo-fashionSigLIP: 512
+    fashion-clip: 512
+    default: 512   # Utilisé si le modèle n'est pas dans la liste
+
+# ── Text Encoder ──────────────────────────────────────────────
+text_encoder:
+  # Modèle sentence-transformer pour les embeddings texte
+  # Supporte 50+ langues (français, anglais, arabe…)
+  model: "${TEXT_ENCODER_MODEL:-paraphrase-multilingual-mpnet-base-v2}"
+  output_dim: 768
+  max_seq_length: 256
+  batch_size: 128
+
+  # Alternatives selon les besoins:
+  # "sentence-transformers/all-mpnet-base-v2" — anglais seulement, meilleure qualité
+  # "sentence-transformers/LaBSE"             — 109 langues, idéal marché africain/MENA
+  # "intfloat/multilingual-e5-large"          — état de l'art multilingue 2026

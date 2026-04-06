@@ -14,10 +14,21 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Configuration Triton
-TRITON_URL = "http://triton:8000"
-TRITON_GRPC_URL = "triton:8001"
-TRITON_METRICS_URL = "http://triton:8002"
+import os as _os
+
+def _get_triton_config() -> dict:
+    try:
+        from ml.config_loader import get_infrastructure_config
+        return get_infrastructure_config().get("triton", {})
+    except Exception:
+        return {}
+
+_TRITON_CFG = _get_triton_config()
+
+# URLs Triton — priorité : env var > infrastructure.yaml > fallback Docker hostname
+TRITON_URL         = _os.environ.get("TRITON_URL",         _TRITON_CFG.get("http_url",     "http://triton:8000"))
+TRITON_GRPC_URL    = _os.environ.get("TRITON_GRPC_URL",    _TRITON_CFG.get("grpc_url",     "triton:8001"))
+TRITON_METRICS_URL = _os.environ.get("TRITON_METRICS_URL", _TRITON_CFG.get("metrics_url",  "http://triton:8002"))
 
 
 class TritonClient:

@@ -63,13 +63,28 @@ VIOLATION_CATEGORIES = [
     "price_manipulation",    # Fake discounts, inflated compare_at_price
 ]
 
-# Action thresholds
-AUTO_REMOVE_THRESHOLD = 0.85    # Score > 0.85 → auto-remove + human review
-HUMAN_REVIEW_THRESHOLD = 0.50   # Score 0.50-0.85 → queue for human review
-ALLOW_THRESHOLD = 0.50          # Score < 0.50 → allow
+# Thresholds de modération (configurable via configs/infrastructure.yaml)
+def _get_moderation_config() -> dict:
+    try:
+        from ml.config_loader import get_infrastructure_config
+        return get_infrastructure_config().get("moderation", {})
+    except Exception:
+        return {}
 
-# Llama Scout vLLM endpoint for explainability
-LLAMA_VLLM_BASE = "http://localhost:8200/v1"
+_MOD_CFG = _get_moderation_config()
+
+AUTO_REMOVE_THRESHOLD  = float(_MOD_CFG.get("auto_remove_threshold",  0.85))
+HUMAN_REVIEW_THRESHOLD = float(_MOD_CFG.get("human_review_threshold", 0.50))
+ALLOW_THRESHOLD        = float(_MOD_CFG.get("human_review_threshold", 0.50))
+
+# URL du LLM pour les explications Scout — lu depuis infrastructure.yaml
+# Override via env var MODERATION_LLM_URL ou SCOUT_URL
+import os as _os
+LLAMA_VLLM_BASE = (
+    _os.environ.get("MODERATION_LLM_URL")
+    or _MOD_CFG.get("llm_base_url")
+    or _os.environ.get("SCOUT_URL", "http://localhost:8200") + "/v1"
+)
 
 
 class ContentModerator(nn.Module if HAS_TORCH else object):

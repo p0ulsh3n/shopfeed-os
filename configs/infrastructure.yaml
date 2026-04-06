@@ -1,0 +1,53 @@
+# ============================================================
+# ShopFeed ML — Infrastructure & Services Configuration
+# ============================================================
+# Toutes les URLs, ports, et paramètres d'infrastructure.
+# Résolution via env vars: ${VAR:-default}
+# ============================================================
+
+# ── Redpanda / Kafka Streaming ──────────────────────────────
+redpanda:
+  brokers: "${REDPANDA_BROKERS:-${KAFKA_BROKERS:-redpanda-1:9092,redpanda-2:9092,redpanda-3:9092}}"
+  topics:
+    interaction_events: "${TOPIC_INTERACTION:-shopfeed.interaction_events}"
+    product_updates:    "${TOPIC_PRODUCT:-shopfeed.product_updates}"
+    ad_events:          "${TOPIC_ADS:-shopfeed.ad_events}"
+    live_events:        "${TOPIC_LIVE:-shopfeed.live_events}"
+  consumer_group_prefix: "${KAFKA_GROUP_PREFIX:-shopfeed-ml}"
+
+
+llm:
+  # URL du serveur LLM (SGLang par défaut, compatible OpenAI API)
+  # SGLang est recommandé (RadixAttention, JSON mode natif)
+  base_url: "${SCOUT_URL:-http://localhost:8200}"
+  model: "${LLM_MODEL:-meta-llama/Llama-4-Scout-17B-16E}"
+  timeout_s: 30
+  max_tokens_default: 512
+  temperature_json: 0.05   # Low temperature for JSON outputs
+  temperature_text: 0.3
+
+  # SGLang settings (si SERVING_ENGINE=sglang)
+  sglang:
+    port: "${SGLANG_PORT:-30000}"
+    tensor_parallel_size: "${SGLANG_TP:-1}"
+    gpu_memory_utilization: "${SGLANG_GPU_MEM:-0.90}"
+    quantization: "${SGLANG_QUANT:-}"   # fp8 | int4 | awq | "" (none)
+
+# ── Triton Inference Server ─────────────────────────────────
+triton:
+  http_url: "${TRITON_URL:-http://triton:8000}"
+  grpc_url: "${TRITON_GRPC_URL:-triton:8001}"
+  metrics_url: "${TRITON_METRICS_URL:-http://triton:8002}"
+  timeout_s: 5.0
+
+# ── Moderation ──────────────────────────────────────────────
+moderation:
+  llm_base_url: "${MODERATION_LLM_URL:-${SCOUT_URL:-http://localhost:8200}/v1}"
+  vit_model: "${MODERATION_VIT_MODEL:-google/vit-base-patch16-224}"
+  auto_remove_threshold: 0.85
+  human_review_threshold: 0.50
+
+# ── SGLang (standalone) ─────────────────────────────────────
+sglang:
+  host: "${SGLANG_HOST:-127.0.0.1}"
+  port: "${SGLANG_PORT:-30000}"

@@ -11,8 +11,13 @@ features:
   user_dense_dim: 764     # 256 (CLIP) + 500 (cat prefs) + 3 + 3 + 2
   item_dense_dim: 1348    # 512 (CLIP) + 768 (text) + 1 + N_cat + 1 + 1 + 64 + 1
   embedding_dim: 256      # Shared embedding space dimension
-  n_categories: 500       # Product categories count
+  n_categories: 500       # Product categories count (ALL domains: fashion, electronics, food, auto…)
   n_items: 1000000        # Maximum item vocabulary
+  # Sub-vector dimensions (used by feature_store/pipeline.py)
+  vendor_emb_dim: 64      # Vendor embedding from vendor_embeddings.py
+  visual_emb_dim: 512     # CLIP / SigLIP visual embedding (generic or domain-specific)
+  text_emb_dim: 768       # sentence-transformers text embedding
+  session_vec_dim: 128    # BST session intent vector output dimension
 
 # ── Model: Two-Tower ────────────────────────────────────────
 two_tower:

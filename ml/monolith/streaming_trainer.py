@@ -54,8 +54,16 @@ class MonolithConfig:
     gradient_accumulation: int = 4      # Accumulate before optimizer step
 
     # Sync (Parameter Server replacement)
-    sync_interval_s: float = 600        # 10 min default (5-15 min range)
+    # 2026 best-practice: 60s default (vs old 600s) to close the gap with
+    # TikTok Monolith (<1s hotspot sync). For trending items (live shopping,
+    # viral new products) a separate aggressive flush path targets 15s.
+    sync_interval_s: float = 60         # 1 min default (was 600s)
+    trending_sync_interval_s: float = 15  # Aggressive flush for live/viral items
     checkpoint_interval_s: float = 3600  # Hourly checkpoints
+
+    # Trending detection thresholds — an item is "trending" if it receives
+    # more than trending_event_threshold events since the last sync.
+    trending_event_threshold: int = 50
 
     # Infrastructure — Redpanda (Kafka-compatible, archi-2026 §5)
     redpanda_brokers: str = "redpanda-1:9092,redpanda-2:9092,redpanda-3:9092"
@@ -122,17 +130,21 @@ class MonolithStreamingTrainer:
         # Buffers and state
         self._event_buffer: list[dict[str, Any]] = []
         self._last_sync = time.time()
+        self._last_trending_sync = time.time()
         self._last_checkpoint = time.time()
         self._events_processed = 0
         self._total_events = 0
         self._running = False
         # BUG #14 FIX: track how many micro-batches have accumulated
         self._accum_steps = 0
+        # Trending item counter: tracks event count per item since last sync.
+        # Items exceeding cfg.trending_event_threshold get priority flush.
+        self._item_event_counts: dict[str, int] = {}
 
         logger.info(
             "MonolithStreamingTrainer initialized — "
-            "embed_dim=%d, sync=%ds, lr=%.4f, buffer=%d",
-            cfg.embed_dim, cfg.sync_interval_s,
+            "embed_dim=%d, sync=%ds, trending_sync=%ds, lr=%.4f, buffer=%d",
+            cfg.embed_dim, cfg.sync_interval_s, cfg.trending_sync_interval_s,
             cfg.learning_rate, cfg.micro_batch_size,
         )
 
@@ -178,6 +190,12 @@ class MonolithStreamingTrainer:
             item_id = str(event.get("item_id", event.get("product_id", "")))
             user_id = str(event.get("user_id", ""))
             action = str(event.get("action", event.get("event_type", "")))
+
+            # Track event frequency per item for trending detection
+            if item_id:
+                self._item_event_counts[item_id] = (
+                    self._item_event_counts.get(item_id, 0) + 1
+                )
 
             if not item_id:
                 continue
@@ -247,8 +265,29 @@ class MonolithStreamingTrainer:
         avg_loss = batch_loss / max(n_valid, 1)
         self._event_buffer.clear()
 
-        # ── Periodic sync to Redis ──
         now = time.time()
+
+        # ── Trending items: aggressive sync every 15s ─────────
+        # Items with high event frequency (live shopping, viral products)
+        # are flushed on a faster schedule to close the gap with TikTok
+        # Monolith's hotspot update latency. Only trending items are flushed,
+        # not the entire embedding table — keeps Redis write pressure low.
+        trending_items = {
+            iid for iid, cnt in self._item_event_counts.items()
+            if cnt >= cfg.trending_event_threshold
+        }
+        if trending_items and now - self._last_trending_sync > cfg.trending_sync_interval_s:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._sync_trending_to_redis(trending_items))
+            except RuntimeError:
+                logger.debug("Trending Redis sync deferred — not in async context")
+            self._last_trending_sync = now
+            # Reset counters for flushed items
+            for iid in trending_items:
+                self._item_event_counts.pop(iid, None)
+
+        # ── Periodic full sync to Redis ──
         if now - self._last_sync > cfg.sync_interval_s:
             # BUG #13 FIX: asyncio.get_event_loop() is deprecated in Python 3.10+.
             # Use get_running_loop() which raises RuntimeError if not in async context.
@@ -260,6 +299,8 @@ class MonolithStreamingTrainer:
                 # Sync will be handled by sync_to_redis_blocking() or next async run().
                 logger.debug("Redis sync deferred — not in async context")
             self._last_sync = now
+            # Full sync also resets all item event counters
+            self._item_event_counts.clear()
 
         # ── Periodic checkpoint ──
         if now - self._last_checkpoint > cfg.checkpoint_interval_s:
@@ -268,20 +309,43 @@ class MonolithStreamingTrainer:
 
     # ── Redis Sync (replaces Parameter Server) ───────────────
 
+    async def _sync_trending_to_redis(self, item_ids: set[str]) -> None:
+        """Aggressive partial sync — push only trending item embeddings.
+
+        Runs every 15s for items with high event frequency (live shopping
+        sessions, viral new products). Keeps write pressure on Redis low
+        while dramatically reducing the latency gap with TikTok Monolith
+        for the items that matter most commercially.
+        """
+        await self.feature_store.connect()
+        n_synced = 0
+        for item_id in item_ids:
+            emb = self.embedding_table.get(item_id)
+            if emb is not None:
+                await self.feature_store.set_embedding(item_id, emb)
+                n_synced += 1
+
+        if n_synced:
+            logger.info(
+                "Trending sync — %d hot-items flushed to Redis (15s path)",
+                n_synced,
+            )
+
     async def _sync_to_redis(self) -> None:
-        """Push updated embeddings + delta scores to Redis.
+        """Push all updated embeddings + delta scores to Redis.
 
         This is the 2026 replacement for Monolith's Parameter Server.
         Redis gives <5ms reads at serving time.
 
-        Section 14: "Sync vers serving layer toutes les 5-15 minutes
-        pour stabilité."
+        2026 update: runs every 60s (was 5-15 min) to close the latency
+        gap with TikTok Monolith. Trending items get the faster 15s path
+        via _sync_trending_to_redis().
         """
         await self.feature_store.connect()
         n_synced = await self.feature_store.sync_from_cuckoo(self.embedding_table)
 
         logger.info(
-            "Redis sync complete — %d embeddings pushed, %d events since last sync",
+            "Redis full-sync — %d embeddings pushed, %d events since last sync",
             n_synced, self._events_processed,
         )
         self._events_processed = 0

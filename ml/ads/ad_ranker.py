@@ -122,9 +122,18 @@ class AdRanker:
 
     def __init__(
         self,
-        triton_url: str = "localhost:8001",
+        triton_url: str | None = None,
         store_traffic_weight: float = 0.4,
     ):
+        # triton_url: priorité env var > infrastructure.yaml > fallback Docker hostname
+        if triton_url is None:
+            import os
+            try:
+                from ml.config_loader import get_infrastructure_config
+                _cfg = get_infrastructure_config().get("triton", {})
+                triton_url = os.environ.get("TRITON_GRPC_URL", _cfg.get("grpc_url", "triton:8001"))
+            except Exception:
+                triton_url = os.environ.get("TRITON_GRPC_URL", "triton:8001")
         self.triton_url = triton_url
         self.store_traffic_weight = store_traffic_weight
         self._triton = None

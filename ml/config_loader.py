@@ -118,6 +118,70 @@ def get_spark_config() -> dict[str, Any]:
     return load_config("spark")
 
 
+@lru_cache(maxsize=1)
+def get_infrastructure_config() -> dict[str, Any]:
+    """Cached infrastructure config (URLs, ports, LLM, Triton, SGLang)."""
+    return load_config("infrastructure")
+
+
+@lru_cache(maxsize=1)
+def get_encoder_config() -> dict[str, Any]:
+    """Cached encoder config (visual & text model selection by domain)."""
+    return load_config("encoders")
+
+
+def get_visual_encoder_model(domain: str | None = None) -> dict[str, str]:
+    """Return the visual encoder model config for a given domain.
+
+    Reads from configs/encoders.yaml. Falls back to generic if domain
+    is not found. This is the single source of truth for which CLIP/SigLIP
+    model to load — no more hardcoded model names in Python code.
+
+    Args:
+        domain: Encoder domain. If None, reads VISUAL_ENCODER_DOMAIN env var,
+                then falls back to 'generic'.
+
+    Returns:
+        Dict with 'primary', optionally 'fallback', 'pretrained', 'description'.
+    """
+    import os
+    cfg = get_encoder_config()
+    ve_cfg = cfg.get("visual_encoder", {})
+
+    if domain is None:
+        domain = os.environ.get(
+            "VISUAL_ENCODER_DOMAIN",
+            ve_cfg.get("domain", "generic"),
+        )
+
+    models = ve_cfg.get("models", {})
+    domain_cfg = models.get(domain) or models.get("generic") or {}
+    return domain_cfg
+
+
+def get_visual_encoder_output_dim(model_id: str | None = None) -> int:
+    """Return output dimension for a visual encoder model."""
+    cfg = get_encoder_config()
+    dims = cfg.get("visual_encoder", {}).get("output_dims", {})
+    if model_id:
+        # Try exact match, then suffix match
+        for key, dim in dims.items():
+            if key in (model_id or ""):
+                return int(dim)
+    return int(dims.get("default", 512))
+
+
+def get_text_encoder_model() -> str:
+    """Return the configured text encoder model name."""
+    import os
+    cfg = get_encoder_config()
+    return (
+        os.environ.get("TEXT_ENCODER_MODEL")
+        or cfg.get("text_encoder", {}).get("model")
+        or "paraphrase-multilingual-mpnet-base-v2"
+    )
+
+
 def get_model_config(model_name: str) -> dict[str, Any]:
     """Get config for a specific model from training.yaml.
 

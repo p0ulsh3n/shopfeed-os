@@ -91,10 +91,19 @@ class EpsilonEngine:
         self,
         redis_client: Any = None,
         faiss_index: Any = None,
-        triton_url: str = "localhost:8001",
+        triton_url: str | None = None,
         num_ad_slots: int = 3,
         reserve_price: float = 0.10,
     ):
+        # triton_url: priorité env var > infrastructure.yaml > fallback Docker hostname
+        if triton_url is None:
+            import os
+            try:
+                from ml.config_loader import get_infrastructure_config
+                _cfg = get_infrastructure_config().get("triton", {})
+                triton_url = os.environ.get("TRITON_GRPC_URL", _cfg.get("grpc_url", "triton:8001"))
+            except Exception:
+                triton_url = os.environ.get("TRITON_GRPC_URL", "triton:8001")
         self.retrieval = MultiModalAdRetrieval()
         self.ranker = AdRanker(triton_url=triton_url, store_traffic_weight=0.4)
         self.auction = GSPAuction(reserve_price=reserve_price)

@@ -8,6 +8,7 @@ Feature Engineering Pipeline — pont critique entre PostgreSQL et les modèles 
 """
 
 from __future__ import annotations
+import os
 import math
 import logging
 from typing import Any
@@ -17,17 +18,34 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# ── Constantes ────────────────────────────────────────────────────────────────
+# ── Constantes — lues depuis configs/training.yaml ───────────────────────────
+#
+# Ne jamais hardcoder ces valeurs ici — elles doivent rester en accord avec
+# configs/training.yaml (features.n_categories, embedding_dim, etc.).
+# Si le YAML n'est pas disponible (tests unitaires, env minimal), les valeurs
+# ci-dessous servent de défaut de sécurité aligné avec le YAML courant.
 
-N_CATEGORIES = 200          # nombre de catégories produits
-VENDOR_EMB_DIM = 64
-VISUAL_EMB_DIM = 512        # CLIP / FashionSigLIP
-TEXT_EMB_DIM = 768          # sentence-transformers
-COMBINED_EMB_DIM = 256      # Two-Tower output
-SESSION_VEC_DIM = 128       # BST output
+def _load_feature_constants() -> dict:
+    """Charge les dimensions depuis configs/training.yaml."""
+    try:
+        from ml.config_loader import get_training_config
+        return get_training_config().get("features", {})
+    except Exception:
+        return {}
 
-# Fraîcheur: décroissance exponentielle τ = 168h (7j)
-FRESHNESS_TAU_HOURS = 168.0
+_FEAT_CFG = _load_feature_constants()
+
+# INCOHÉRENCE FIX: était hardcodé 200 alors que training.yaml dit n_categories: 500
+N_CATEGORIES    = int(_FEAT_CFG.get("n_categories",   500))  # 500 catégories (YAML)
+VENDOR_EMB_DIM  = int(_FEAT_CFG.get("vendor_emb_dim",  64))
+VISUAL_EMB_DIM  = int(_FEAT_CFG.get("visual_emb_dim", 512))  # CLIP / SigLIP
+TEXT_EMB_DIM    = int(_FEAT_CFG.get("text_emb_dim",   768))  # sentence-transformers
+COMBINED_EMB_DIM = int(_FEAT_CFG.get("embedding_dim", 256))  # Two-Tower output
+SESSION_VEC_DIM  = int(_FEAT_CFG.get("session_vec_dim", 128))  # BST output
+
+# Fraîcheur: décroissance exponentielle τ (override via FRESHNESS_TAU_HOURS env var)
+# Ex: 72h pour catalogues flash-sales, 336h (14j) pour catalogues stables
+FRESHNESS_TAU_HOURS = float(os.environ.get("FRESHNESS_TAU_HOURS", "168.0"))
 
 # Personas utilisateur
 PERSONA_LIST = [
@@ -35,6 +53,7 @@ PERSONA_LIST = [
     "impulse_buyer", "researcher", "high_value",
 ]
 PERSONA_IDX = {p: i for i, p in enumerate(PERSONA_LIST)}
+
 
 # Action types → feature vector index
 # t.md §1: Added micro_pause, scroll_slow, gaze_linger, scroll_reverse
