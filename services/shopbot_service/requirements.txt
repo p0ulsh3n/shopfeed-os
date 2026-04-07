@@ -1,0 +1,66 @@
+# ══════════════════════════════════════════════════════════════════
+# ShopBot Service Dependencies
+# ══════════════════════════════════════════════════════════════════
+# Install: pip install -r services/shopbot_service/requirements.txt
+# ══════════════════════════════════════════════════════════════════
+
+# ─── Web Framework ────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1          # standard = uvloop + httptools
+uvloop==0.21.0                     # High-perf async event loop (2× faster than default)
+httptools==0.6.4                   # Fast HTTP parser for uvicorn
+
+# ─── Async PostgreSQL + pgvector ──────────────────────────────────
+asyncpg==0.30.0                    # Raw async PostgreSQL (used for LISTEN/NOTIFY)
+sqlalchemy[asyncio]==2.0.36        # Async ORM (used for queries + schema)
+psycopg2-binary==2.9.10            # Sync PostgreSQL (for migrations/scripts)
+pgvector==0.3.6                    # pgvector Python bindings
+
+# ─── Pydantic + Settings ──────────────────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# ─── LLM / vLLM Client ───────────────────────────────────────────
+openai==1.57.4                     # OpenAI-compatible client (used with vLLM)
+
+# ─── Embeddings ───────────────────────────────────────────────────
+# multilingual-e5-large-instruct — best multilingual embedding 2026
+sentence-transformers==3.3.1
+torch==2.5.1                       # PyTorch (CPU-only for embeddings, GPU for vLLM)
+# For CPU-only deployment (no CUDA), use:
+# torch==2.5.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+transformers==4.47.1
+tokenizers==0.21.0
+huggingface-hub==0.27.0
+
+# ─── Numerical Computing ──────────────────────────────────────────
+numpy==2.2.0
+scipy==1.15.0                      # Used for sparse matrix operations (BM25 helpers)
+
+# ─── Cache (Redis) ────────────────────────────────────────────────
+redis[hiredis]==5.2.1              # hiredis = C parser, 10× faster
+aioredis==2.0.1
+
+# ─── HTTP Client ──────────────────────────────────────────────────
+httpx==0.28.1                      # Async HTTP for internal service calls
+aiohttp==3.11.10
+
+# ─── Utilities ────────────────────────────────────────────────────
+python-multipart==0.0.20           # Form data / file uploads
+python-dotenv==1.0.1               # .env file loading
+orjson==3.10.12                    # Fast JSON (10× faster than stdlib json)
+ujson==5.10.0                      # Ultra-fast JSON alternative
+tenacity==9.0.0                    # Retry logic with exponential backoff
+structlog==24.4.0                  # Structured logging
+
+# ─── Monitoring & Observability ───────────────────────────────────
+prometheus-client==0.21.1          # Prometheus metrics endpoint
+opentelemetry-api==1.29.0          # OpenTelemetry tracing
+opentelemetry-sdk==1.29.0
+opentelemetry-instrumentation-fastapi==0.50b0
+
+# ─── Testing (dev only) ───────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+httpx==0.28.1                      # For TestClient in FastAPI tests

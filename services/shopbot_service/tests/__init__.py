@@ -1,0 +1,1 @@
+"""ShopBot tests package."""

@@ -1,0 +1,214 @@
+# ══════════════════════════════════════════════════════════════════
+# ShopFeed ShopBot — Docker Compose Stack
+# ══════════════════════════════════════════════════════════════════
+# Services:
+#   shopbot      — FastAPI ShopBot service (port 8070)
+#   vllm         — Qwen2.5-VL-7B-AWQ inference server (port 8000)
+#   postgres     — PostgreSQL 16 + pgvector (port 5432)
+#   redis        — Redis 7 cache (port 6379)
+#   pgadmin      — DB admin UI (port 5050, dev only)
+#
+# Usage:
+#   docker compose up -d                    # Start all services
+#   docker compose up shopbot postgres redis # Start without vLLM (dev)
+#   docker compose logs -f shopbot          # Follow logs
+# ══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ────────────────────────────────────────────────────────────────
+  # PostgreSQL 16 + pgvector
+  # ────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16          # Official pgvector image (2026 standard)
+    container_name: shopbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shopfeed
+      POSTGRES_USER: shopbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shopbot_dev_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-run init scripts on first start
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopbot -d shopfeed"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - shopbot-net
+
+  # ────────────────────────────────────────────────────────────────
+  # Redis 7 — Session cache & rate limiting
+  # ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: shopbot-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - shopbot-net
+
+  # ────────────────────────────────────────────────────────────────
+  # vLLM — Self-hosted LLM inference server
+  # Runs Qwen2.5-VL-7B-Instruct-AWQ with APC enabled
+  # Requires GPU (NVIDIA, 16GB+ VRAM recommended)
+  # ────────────────────────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:v0.6.4       # Production-ready vLLM image
+    container_name: shopbot-vllm
+    restart: unless-stopped
+    runtime: nvidia                        # GPU access
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Hugging Face token for gated models (if needed)
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # Cache HuggingFace models to avoid re-downloading
+      - hf_cache:/root/.cache/huggingface
+    command: >
+      --model Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+      --quantization awq
+      --enable-prefix-caching
+      --max-model-len 8192
+      --max-num-seqs 64
+      --gpu-memory-utilization 0.90
+      --dtype auto
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s                   # Model loading takes ~2min
+    networks:
+      - shopbot-net
+
+  # ────────────────────────────────────────────────────────────────
+  # ShopBot — FastAPI service
+  # ────────────────────────────────────────────────────────────────
+  shopbot:
+    build:
+      context: ../..                       # Repo root (shopfeed-os/)
+      dockerfile: services/shopbot_service/Dockerfile
+      args:
+        DOWNLOAD_MODEL: "true"             # Bake model weights into image
+    container_name: shopbot-api
+    restart: unless-stopped
+    environment:
+      # ── App ──────────────────────────────────────────────────
+      SHOPBOT_ENVIRONMENT: ${SHOPBOT_ENVIRONMENT:-production}
+      SHOPBOT_LOG_LEVEL: ${SHOPBOT_LOG_LEVEL:-INFO}
+      SHOPBOT_API_WORKERS: ${SHOPBOT_API_WORKERS:-4}
+      # ── Auth ─────────────────────────────────────────────────
+      SHOPBOT_INTERNAL_API_KEY: ${SHOPBOT_INTERNAL_API_KEY:?SHOPBOT_INTERNAL_API_KEY is required}
+      # ── vLLM ─────────────────────────────────────────────────
+      SHOPBOT_VLLM_BASE_URL: http://vllm:8000/v1
+      SHOPBOT_VLLM_MODEL: Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+      SHOPBOT_VLLM_MAX_TOKENS: "1024"
+      SHOPBOT_VLLM_TEMPERATURE: "0.3"
+      # ── Database ──────────────────────────────────────────────
+      SHOPBOT_DATABASE_URL: postgresql+asyncpg://shopbot:${POSTGRES_PASSWORD:-shopbot_dev_pass}@postgres:5432/shopfeed
+      # ── Redis ─────────────────────────────────────────────────
+      SHOPBOT_REDIS_URL: redis://redis:6379/2
+      SHOPBOT_CACHE_ENABLED: "true"
+      SHOPBOT_CACHE_TTL_SECONDS: "300"
+      # ── Embeddings ────────────────────────────────────────────
+      SHOPBOT_EMBEDDING_MODEL: intfloat/multilingual-e5-large-instruct
+      SHOPBOT_EMBEDDING_DEVICE: cpu                # cpu in container (GPU for prod)
+      SHOPBOT_EMBEDDING_QUANTIZATION: int8
+      SHOPBOT_EMBEDDING_RESCORING: "true"
+      # ── Search ────────────────────────────────────────────────
+      SHOPBOT_RETRIEVAL_FINAL_TOP_K: "8"
+      SHOPBOT_MAX_CONTEXT_PRODUCTS: "8"
+    ports:
+      - "8070:8070"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8070/api/v1/shopbot/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - shopbot-net
+
+  # ────────────────────────────────────────────────────────────────
+  # pgAdmin — Database admin UI (development only)
+  # Access: http://localhost:5050
+  # Login: admin@shopfeed.com / admin
+  # ────────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:8.12
+    container_name: shopbot-pgadmin
+    restart: unless-stopped
+    profiles: ["dev"]                      # Only starts with: docker compose --profile dev up
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@shopfeed.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - shopbot-net
+
+# ────────────────────────────────────────────────────────────────
+# Volumes
+# ────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: shopbot_postgres_data
+  redis_data:
+    name: shopbot_redis_data
+  hf_cache:
+    name: shopbot_hf_cache           # Shared HuggingFace model cache
+  pgadmin_data:
+    name: shopbot_pgadmin_data
+
+# ────────────────────────────────────────────────────────────────
+# Networks
+# ────────────────────────────────────────────────────────────────
+networks:
+  shopbot-net:
+    name: shopbot-network
+    driver: bridge
