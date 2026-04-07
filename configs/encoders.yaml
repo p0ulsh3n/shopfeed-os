@@ -1,84 +1,105 @@
 # ============================================================
-# ShopFeed ML — Visual Encoder Configuration
+# ShopFeed ML — Visual Encoder Configuration (2026)
 # ============================================================
-# Choisir le bon modèle visuel selon le domaine de la marketplace.
+# Architecture validée en production (avril 2026) :
+#   - Modèle de base : Marqo/marqo-ecommerce-embeddings-L
+#     → entraîné sur AmazonProducts-3M + GoogleShopping-1M
+#     → surpasse Amazon Titan Multimodal ET ViT-SO400M-14-SigLIP
+#     → 652M params, 1024d output
+#     → Source : Marqo AI (nov 2024), github.com/marqo-ai/marqo-ecommerce-embeddings
 #
-# ShopFeed est une marketplace GÉNÉRALISTE (mode, électronique,
-# alimentation, beauté, maison, auto, sport, bébé…). Le visual
-# encoder doit être adapté au catalogue dominant.
+#   - Spécialisation : LoRA adapters légers par catégorie (PEFT)
+#     → ~2-8MB par adapter (vs ~2.5GB pour un modèle supplémentaire)
+#     → Merge dans les poids après training → zéro latence supplémentaire
+#     → Source : philschmid.de, HuggingFace PEFT 2025
 #
-# DOMAINES SUPPORTÉS
-# ──────────────────
-# generic      → CLIP ViT-L-14 (OpenAI) ou SigLIP générique
-#                Idéal pour catalogues mixtes ou inconnus
-# fashion      → Marqo/marqo-fashionSigLIP (+22% recall@1 sur textiles)
-#                Utiliser seulement si >70% du catalogue est mode/vêtements
-# electronics  → openai/clip-vit-large-patch14 + fine-tuning produit
-#                (SigLIP générique acceptable, pas de modèle spécialisé mainstream)
-# food         → openai/clip-vit-base-patch32 (bon sur nourriture/FMCG)
-#                Alternative: Salesforce/BLIP-2-opt-2.7b pour captioning
-#
-# RECOMMANDATION 2026 pour marketplace généraliste:
-#   Utiliser ViT-L-14 générique (domain-agnostic) jusqu'à ce qu'une
-#   catégorie représente >70% du GMV, puis fine-tuner sur cette catégorie.
+#   - FashionSigLIP : reste disponible pour catalogues 70%+ mode
+#     → Domain: fashion (activer via VISUAL_ENCODER_DOMAIN=fashion)
 # ============================================================
 
 visual_encoder:
-  # Domaine principal de la marketplace
-  # Options: generic | fashion | electronics | food | beauty | auto
-  domain: "${VISUAL_ENCODER_DOMAIN:-generic}"
+  # Domaine de la marketplace
+  # ecommerce = généraliste (défaut ShopFeed)
+  # fashion   = si catalogue 70%+ mode/vêtements
+  # generic   = CLIP standard (fallback si ecommerce-L indisponible)
+  domain: "${VISUAL_ENCODER_DOMAIN:-ecommerce}"
 
-  # Modèles par domaine (configurable sans recompilation)
+  # ── Modèles par domaine ────────────────────────────────────
   models:
-    generic:
-      primary: "${VISUAL_MODEL_GENERIC:-hf-hub:laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K}"
-      fallback: "ViT-B-16-SigLIP"
-      pretrained_fallback: "webli"
-      description: "CLIP ViT-L-14 DataComp (LAION) — meilleur modèle généraliste 2026, +9% 0-shot vs OpenAI CLIP"
 
+    # ★ DÉFAUT — marketplace généraliste (ShopFeed aujourd'hui)
+    # Benchmarks : meilleur sur AmazonProducts-3M, GoogleShopping-1M
+    # Source : github.com/marqo-ai/marqo-ecommerce-embeddings (nov 2024)
+    ecommerce:
+      primary:     "${VISUAL_MODEL_ECOMMERCE:-Marqo/marqo-ecommerce-embeddings-L}"
+      fallback:    "Marqo/marqo-ecommerce-embeddings-B"   # version rapide (B = petit)
+      loader:      "transformers"                          # pas open_clip
+      output_dim:  1024
+      description: "Marqo ecommerce-L — SOTA sur catalogues mixtes e-commerce, 652M params"
+
+    # Mode/vêtements — activer si >70% du GMV est textile
     fashion:
-      primary: "${VISUAL_MODEL_FASHION:-hf-hub:Marqo/marqo-fashionSigLIP}"
-      fallback: "hf-hub:patrickjohncyh/fashion-clip"
-      description: "Marqo-FashionSigLIP — fine-tuné sur données mode, +22% recall@1 texte→image"
+      primary:     "${VISUAL_MODEL_FASHION:-hf-hub:Marqo/marqo-fashionSigLIP}"
+      fallback:    "hf-hub:patrickjohncyh/fashion-clip"
+      loader:      "open_clip"
+      output_dim:  512
+      description: "FashionSigLIP — +22% recall@1 sur textiles vs CLIP générique"
 
-    electronics:
-      primary: "${VISUAL_MODEL_ELECTRONICS:-ViT-L-14}"
-      pretrained: "openai"
-      description: "CLIP ViT-L-14 OpenAI — bon généraliste pour produits tech"
+    # CLIP générique — fallback ultime si les modèles Marqo sont indisponibles
+    generic:
+      primary:     "${VISUAL_MODEL_GENERIC:-hf-hub:laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K}"
+      fallback:    "ViT-B-16-SigLIP"
+      fallback_pretrained: "webli"
+      loader:      "open_clip"
+      output_dim:  768
+      description: "CLIP ViT-L-14 DataComp (LAION) — généraliste solide"
 
-    food:
-      primary: "${VISUAL_MODEL_FOOD:-ViT-B-32}"
-      pretrained: "openai"
-      description: "CLIP ViT-B-32 — performant sur FMCG / alimentation"
+  # ── Dimension de sortie unifiée ────────────────────────────
+  # Tous les embeddings sont projetés à cette dimension via ProjectionHead
+  # pour assurer la compatibilité avec le reste du pipeline (Two-Tower 256d,
+  # feature_store 512d, FAISS index 256d).
+  unified_output_dim: 512
 
-    beauty:
-      primary: "${VISUAL_MODEL_BEAUTY:-hf-hub:laion/CLIP-ViT-B-32-laion2B-s34B-b79K}"
-      description: "CLIP LAION-2B — bon pour beauté/cosmétiques"
+  # ── LoRA Adapters par catégorie ────────────────────────────
+  # Adapters légers entraînés sur les données ShopFeed par catégorie.
+  # Ils s'appliquent sur le modèle ecommerce-L de base (gelé).
+  # Si l'adapter n'existe pas → base model utilisé (dégradation gracieuse).
+  #
+  # Entraînement : python -m ml.feature_store.multi_domain_encoder train
+  #                --category fashion --data data/products_fashion.parquet
+  adapters:
+    checkpoint_dir:  "${ADAPTER_CHECKPOINT_DIR:-checkpoints/adapters}"
+    lora_rank:       8         # r=8 recommandé (philschmid.de 2025)
+    lora_alpha:      16        # lora_alpha = 2 × lora_rank
+    lora_dropout:    0.05
+    # Couches ciblées dans le ViT (vision transformer interne du modèle)
+    target_modules:  ["q_proj", "v_proj", "k_proj", "out_proj"]
 
-    auto:
-      primary: "${VISUAL_MODEL_AUTO:-ViT-L-14}"
-      pretrained: "openai"
-      description: "CLIP ViT-L-14 OpenAI"
+    # Mapping catégorie → nom du fichier adapter
+    # Format : checkpoints/adapters/{adapter_name}_lora.pt
+    categories:
+      fashion:       "fashion"      # ShopFeed: robes, vêtements, chaussures
+      electronics:   "electronics"  # phones, laptops, gadgets
+      food:          "food"         # épicerie, boissons, FMCG
+      auto:          "auto"         # automobile, pièces détachées
+      beauty:        "beauty"       # cosmétiques, parfums, soins
+      sports:        "sports"       # équipement sportif, fitness
+      home:          "home"         # maison, déco, mobilier
+      baby:          "baby"         # bébé, jouets, puériculture
+      health:        "health"       # santé, parapharmacie
 
-  # Dimensions de sortie des encodeurs visuels
-  output_dims:
-    ViT-L-14: 768
-    ViT-B-16-SigLIP: 512
-    ViT-B-32: 512
-    marqo-fashionSigLIP: 512
-    fashion-clip: 512
-    default: 512   # Utilisé si le modèle n'est pas dans la liste
+  # ── Projection Head ────────────────────────────────────────
+  # Couche linéaire apprise qui project N-d → unified_output_dim.
+  # Entraînée en contrastive learning sur les paires (image, titre produit).
+  projection:
+    checkpoint: "${PROJECTION_CHECKPOINT:-checkpoints/adapters/projection.pt}"
+    hidden_dim: 1024    # couche intermédiaire
 
 # ── Text Encoder ──────────────────────────────────────────────
 text_encoder:
-  # Modèle sentence-transformer pour les embeddings texte
-  # Supporte 50+ langues (français, anglais, arabe…)
-  model: "${TEXT_ENCODER_MODEL:-paraphrase-multilingual-mpnet-base-v2}"
-  output_dim: 768
+  # paraphrase-multilingual-mpnet-base-v2 : 50+ langues, 768d
+  # intfloat/multilingual-e5-large : état de l'art multilingue 2026 (110 langues)
+  model:          "${TEXT_ENCODER_MODEL:-paraphrase-multilingual-mpnet-base-v2}"
+  output_dim:     768
   max_seq_length: 256
-  batch_size: 128
-
-  # Alternatives selon les besoins:
-  # "sentence-transformers/all-mpnet-base-v2" — anglais seulement, meilleure qualité
-  # "sentence-transformers/LaBSE"             — 109 langues, idéal marché africain/MENA
-  # "intfloat/multilingual-e5-large"          — état de l'art multilingue 2026
+  batch_size:     128

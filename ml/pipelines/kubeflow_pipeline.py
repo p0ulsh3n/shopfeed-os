@@ -212,9 +212,16 @@ def validate_model(model_path: str) -> bool:
 # ── CronJob Schedule ───────────────────────────────────────────
 
 TRAINING_SCHEDULE = {
-    "recommendation_model": "0 */6 * * *",      # Every 6 hours
-    "user_embeddings": "0 */2 * * *",            # Every 2 hours
-    "fraud_model": "0 0 * * 1",                  # Weekly (Monday midnight)
-    "moderation_model": "0 0 1 * *",             # Monthly
-    "drift_check": "0 6 * * *",                  # Daily at 6 AM
+    "recommendation_model":    "0 */6 * * *",   # Toutes les 6h
+    "user_embeddings":         "0 */2 * * *",   # Toutes les 2h
+    "fraud_model":             "0 0 * * 1",     # Hebdomadaire (lundi)
+    "moderation_model":        "0 0 1 * *",     # Mensuel
+    "drift_check":             "0 6 * * *",     # Quotidien à 6h
+    # ── Ajouté — Fine-tuning encodeurs visuels ──────────────────
+    # Déclenché manuellement AVANT la prod via ml.pipelines.pretrain_finetune
+    # Puis automatisé mensuellement si >50K nouveaux produits dans le mois
+    "visual_lora_adapters":    "0 2 1 * *",     # Mensuel (1er du mois à 2h)
+    "projection_head":         "0 3 1 * *",     # Mensuel (après visual_lora)
+    "faiss_reindex":           "0 4 * * 0",     # Hebdomadaire (dimanche à 4h)
 }
+

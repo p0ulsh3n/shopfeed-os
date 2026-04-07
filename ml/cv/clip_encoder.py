@@ -1,151 +1,104 @@
 """
-CLIP Encoder — embeddings visuels 512d pour produits et textes.
+CLIP Encoder — Embeddings visuels produits (adapter LoRA 2026)
+==============================================================
+Ce module est la facade légère du feature store visuel.
+Toute la logique réelle est dans ml.feature_store.encoders (API production)
+et ml.feature_store.multi_domain_encoder (EcommerceEncoder).
 
-Stratégie:
-  Mode (catégorie 1): Marqo/marqo-fashionSigLIP (+22% recall@1 vs CLIP générique)
-  Autres catégories:   ViT-B/32 OpenAI CLIP (gelé)
+AVANT (v1)  : category_id == 1 → FashionSigLIP, sinon ViT-B/32
+MAINTENANT  : encode_product_image() → ecommerce-L + LoRA par catégorie
 
-Ces encodeurs sont GELÉS — jamais re-entraînés.
-Les embeddings sont stockés dans catalog_db.products.clip_embedding (vector 512).
+Backward compat : l'ancienne signature encode_product_image(url, category_id)
+est conservée mais délègue à la nouvelle API.
+
+Modèle de base : Marqo/marqo-ecommerce-embeddings-L (652M, 1024d → proj → 512d)
+Config         : configs/encoders.yaml
 """
 
 from __future__ import annotations
-import logging
-import os
-from typing import Optional
 
+import logging
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Catégorie ID de la Mode
-FASHION_CATEGORY_ID = 1
-
-# Modèles disponibles
-FASHION_MODEL_NAME = "Marqo/marqo-fashionSigLIP"
-GENERIC_MODEL_NAME = "ViT-B/32"
-
-_fashion_model = None
-_generic_model = None
-_text_model = None  # sentence-transformers
-
-
-def _get_fashion_model():
-    global _fashion_model
-    if _fashion_model is None:
-        try:
-            from ml.feature_store.encoders import get_visual_encoder
-            _fashion_model = get_visual_encoder(model_name=FASHION_MODEL_NAME)
-            logger.info(f"FashionSigLIP encoder loaded: {FASHION_MODEL_NAME}")
-        except Exception as e:
-            logger.error(f"Failed to load FashionSigLIP: {e}")
-    return _fashion_model
-
-
-def _get_generic_model():
-    global _generic_model
-    if _generic_model is None:
-        try:
-            import open_clip
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32",
-                pretrained="openai",
-            )
-            model.eval()
-            _generic_model = (model, preprocess)
-            logger.info("Generic CLIP (ViT-B/32) loaded.")
-        except ImportError:
-            logger.warning("open_clip not installed. Using zero vectors for CLIP.")
-        except Exception as e:
-            logger.error(f"Failed to load generic CLIP: {e}")
-    return _generic_model
-
-
-def _get_text_encoder():
-    global _text_model
-    if _text_model is None:
-        try:
-            from ml.feature_store.encoders import get_text_encoder
-            _text_model = get_text_encoder()
-        except Exception as e:
-            logger.error(f"Failed to load text encoder: {e}")
-    return _text_model
-
-
-def _load_image_from_url(image_url: str):
-    """Charge une image depuis une URL en PIL Image."""
-    from PIL import Image
-    import httpx
-    resp = httpx.get(image_url, timeout=10)
-    resp.raise_for_status()
-    import io
-    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+# Mapping category_id (entier legacy) → nom de domaine (str YAML)
+# Permet la compat avec le code qui utilise category_id=1 pour la mode
+CATEGORY_ID_TO_DOMAIN: dict[int, str] = {
+    1:  "fashion",
+    2:  "electronics",
+    3:  "food",
+    4:  "beauty",
+    5:  "home",
+    6:  "sports",
+    7:  "auto",
+    8:  "baby",
+    9:  "health",
+}
 
 
 def encode_product_image(image_url: str, category_id: int = 0) -> np.ndarray:
-    """
-    Encode une image produit en vecteur 512d.
+    """Encode une image produit en vecteur 512d normalisé L2.
+
+    Délègue à ml.feature_store.encoders.encode_product_image() qui utilise
+    EcommerceEncoder (Marqo ecommerce-L + LoRA adapter selon catégorie).
 
     Args:
-        image_url:   URL de l'image (S3 ou CDN)
-        category_id: ID catégorie — détermine le modèle utilisé
+        image_url:   URL de l'image (S3, CDN) ou chemin local
+        category_id: ID catégorie produit (legacy int) — converti en domaine texte
 
     Returns:
-        np.ndarray[512] — L2-normalized embedding
+        np.ndarray[512] — L2-normalized embedding, dtype=float32
     """
-    import torch
+    domain = CATEGORY_ID_TO_DOMAIN.get(category_id, "default")
 
     try:
-        if category_id == FASHION_CATEGORY_ID:
-            model = _get_fashion_model()
-            if model is not None:
-                image = _load_image_from_url(image_url)
-                with torch.no_grad():
-                    emb = model.encode_image(image)
-                    emb_np = emb.cpu().numpy().flatten()
-                    # L2 normalize
-                    norm = np.linalg.norm(emb_np)
-                    return emb_np / max(norm, 1e-8)
-        else:
-            generic = _get_generic_model()
-            if generic is not None:
-                model, preprocess = generic
-                image = _load_image_from_url(image_url)
-                img_tensor = preprocess(image).unsqueeze(0)
-                with torch.no_grad():
-                    emb = model.encode_image(img_tensor)
-                    emb_np = emb.cpu().numpy().flatten()
-                    norm = np.linalg.norm(emb_np)
-                    return emb_np / max(norm, 1e-8)
+        from ml.feature_store.encoders import encode_product_image as _enc
+        tensor = _enc(image_url, category=domain)
+        return tensor.numpy().astype(np.float32)
     except Exception as e:
-        logger.error(f"CLIP encode failed for {image_url}: {e}")
+        logger.error("encode_product_image(%s, cat=%d): %s", image_url, category_id, e)
+        return np.zeros(512, dtype=np.float32)
 
-    return np.zeros(512, dtype=np.float32)
+
+def encode_query_image(image_url: str) -> np.ndarray:
+    """Encode une image de requête utilisateur (ONLINE, pas d'adapter, <10ms GPU).
+
+    Args:
+        image_url: URL ou chemin local
+
+    Returns:
+        np.ndarray[512] — même espace d'embedding que encode_product_image()
+    """
+    try:
+        from ml.feature_store.encoders import encode_query_image as _enc
+        tensor = _enc(image_url)
+        return tensor.numpy().astype(np.float32)
+    except Exception as e:
+        logger.error("encode_query_image(%s): %s", image_url, e)
+        return np.zeros(512, dtype=np.float32)
 
 
 def encode_text(text: str) -> np.ndarray:
-    """
-    Encode un texte en vecteur 768d.
-    Utilise paraphrase-multilingual-mpnet-base-v2 (sentence-transformers).
+    """Encode un texte en vecteur 768d (sentence-transformers multilingue 🔒).
 
     Returns:
         np.ndarray[768]
     """
-    encoder = _get_text_encoder()
-    if encoder is None:
-        return np.zeros(768, dtype=np.float32)
     try:
+        from ml.feature_store.encoders import get_text_encoder
+        encoder = get_text_encoder()
+        if encoder is None:
+            return np.zeros(768, dtype=np.float32)
         emb = encoder.encode(text, normalize_embeddings=True)
-        if hasattr(emb, "numpy"):
-            return emb.numpy()
         return np.array(emb, dtype=np.float32)
     except Exception as e:
-        logger.error(f"Text encode failed: {e}")
+        logger.error("encode_text: %s", e)
         return np.zeros(768, dtype=np.float32)
 
 
 def compute_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    """Cosine similarity entre deux embeddings normalisés."""
+    """Cosine similarity entre deux embeddings normalisés L2."""
     return float(np.dot(emb1, emb2))
 
 
@@ -154,9 +107,9 @@ def find_similar_products(
     faiss_index,
     k: int = 20,
 ) -> list[tuple[str, float]]:
-    """
-    ANN search FAISS → [(product_id, score)] triés par score décroissant.
+    """ANN search FAISS → [(product_id, score)] triés par score décroissant.
+
     Utilisé pour la recherche visuelle (/api/v1/search/visual).
     """
     ids, scores = faiss_index.search(query_emb.reshape(1, -1), k=k)
-    return list(zip(ids, scores))
+    return list(zip(ids[0], scores[0]))
