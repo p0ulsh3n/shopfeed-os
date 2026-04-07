@@ -177,47 +177,43 @@ async def sync_catalog(
     **Note:** Incremental updates happen automatically via PostgreSQL LISTEN/NOTIFY.
     You rarely need to call this endpoint for normal operations.
     """
+    # Fetch all products for this shop via ORM — zéro SQL brut
     from services.shopbot_service.database.connection import AsyncSessionLocal
-    from sqlalchemy import text
+    from services.shopbot_service.retrieval.catalog_sync import ShopbotProductEmbeddingORM
+    from shared.db.models.product import ProductORM
+    from shared.models.product import ProductStatus
+    from sqlalchemy import select
 
-    # Fetch all products for this shop from the main DB
     products = []
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            text("""
-                SELECT
-                    p.id, p.shop_id, p.name, p.description,
-                    p.price, p.currency, p.category, p.availability,
-                    p.stock_quantity, p.sku, p.attributes, p.tags,
-                    p.created_at, p.updated_at
-                FROM products p
-                WHERE p.shop_id = :shop_id
-                  AND p.deleted_at IS NULL
-                ORDER BY p.created_at
-            """),
-            {"shop_id": request.shop_id},
+            select(ProductORM)
+            .where(
+                ProductORM.status == ProductStatus.ACTIVE,
+                ProductORM.deleted_at.is_(None),
+            )
         )
-        rows = result.fetchall()
+        orm_products = result.scalars().all()
 
-    for row in rows:
+    for p in orm_products:
         try:
             product = Product(
-                id=str(row[0]),
-                shop_id=str(row[1]),
-                name=row[2] or "",
-                description=row[3],
-                price=float(row[4] or 0),
-                currency=row[5] or "XAF",
-                category=row[6],
-                availability=row[7] or "in_stock",
-                stock_quantity=row[8],
-                sku=row[9],
-                attributes=row[10] or {},
-                tags=row[11] or [],
+                id=str(p.id),
+                shop_id=str(p.vendor_id),
+                name=p.title or "",
+                description=p.description_full or p.description_short,
+                price=float(p.base_price or 0),
+                currency=p.currency or "XAF",
+                category=str(p.category_id) if p.category_id else None,
+                availability="in_stock" if (p.base_stock or 0) > 0 else "out_of_stock",
+                stock_quantity=p.base_stock,
+                sku=p.platform_sku or p.vendor_sku,
+                attributes=p.attributes or {},
+                tags=p.tags or [],
             )
             products.append(product)
-        except Exception as e:
-            logger.warning(f"Skipping malformed product {row[0]}: {e}")
+        except Exception as exc:
+            logger.warning("Skipping malformed product %s: %s", p.id, exc)
 
     if not products:
         raise HTTPException(
@@ -271,7 +267,7 @@ async def delete_product(
 async def startup(app) -> None:
     """
     Application startup:
-    1. Initialize database schema (idempotent)
+    1. Schema managed by Alembic (run `alembic upgrade head` before deployment)
     2. Load embedding model (lazy, in background)
     3. Start catalog LISTEN/NOTIFY listener
     4. Warm up vLLM client
@@ -281,9 +277,8 @@ async def startup(app) -> None:
 
     logger.info("ShopBot service starting up...")
 
-    # 1. Database schema
-    from services.shopbot_service.database.connection import initialize_schema
-    await initialize_schema()
+    # 1. Schema via Alembic — `alembic upgrade head` doit être lancé avant le démarrage
+    logger.info("DB schema managed by Alembic — run 'alembic upgrade head' if needed")
 
     # 2. Load embedding model in background (don't block startup)
     encoder = EmbeddingEncoder.get_instance()

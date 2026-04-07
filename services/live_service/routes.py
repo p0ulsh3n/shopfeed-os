@@ -1,12 +1,24 @@
-"""Live Service — FastAPI App + Routes — Section 07 / 23."""
+"""
+Live Service — FastAPI App + Routes — Section 07 / 23.
+
+Migration: dicts Python in-memory (_live_sessions, _live_metrics)
+→ SQLAlchemy 2.0 ORM via LiveSessionRepository pour la persistance.
+Les métriques temps-réel (viewers, GMV live) restent dans Redis —
+c'est l'architecture correcte (Redis = volatil temps-réel, PG = persistant).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+import uuid
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from shared.db.session import get_db
+from shared.repositories.live_repository import LiveSessionRepository
 
 from .connection_manager import LiveConnectionManager
 from .schemas import CreateLiveRequest, LiveMetricsResponse
@@ -15,15 +27,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ShopFeed OS — Live Service", version="1.0.0")
 
-# BUG #S5 FIX: LiveConnectionManager now accepts a redis_client for
-# cross-replica pub/sub. Injected at startup from app.state.redis.
-# Falls back to in-memory if Redis is unavailable (single-pod mode).
 manager = LiveConnectionManager(redis_client=None)
+_live_repo = LiveSessionRepository()
+
+# Métriques temps-réel en Redis (ou mémoire locale si Redis down)
+# Pattern correct: Redis pour le volatil, PG pour le persistant
+_live_metrics: dict[str, dict] = {}
 
 
 @app.on_event("startup")
 async def _inject_redis() -> None:
-    """Wire shared Redis client into the connection manager at startup."""
     redis = getattr(app.state, "redis", None)
     if redis is not None:
         manager.redis = redis
@@ -34,30 +47,30 @@ async def _inject_redis() -> None:
             "WebSocket broadcast will NOT work across k8s replicas."
         )
 
-# In-memory live sessions (would be PostgreSQL in production)
-_live_sessions: dict[str, dict] = {}
-_live_metrics: dict[str, dict] = {}
-
 
 # ──────────────────────────────────────────────────────────────
 # REST Endpoints
 # ──────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/live/create")
-async def create_live(req: CreateLiveRequest):
-    """Create a new live session."""
-    import uuid
-    live_id = str(uuid.uuid4())
-    _live_sessions[live_id] = {
-        "id": live_id,
-        "vendor_id": req.vendor_id,
+async def create_live(
+    req: CreateLiveRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    """Create a new live session — persisté en PostgreSQL via ORM."""
+    live = await _live_repo.create(session, {
+        "vendor_id": uuid.UUID(req.vendor_id) if req.vendor_id else uuid.uuid4(),
         "title": req.title,
         "status": "scheduled" if req.scheduled_at else "live",
-        "live_type": req.live_type,
-        "pinned_product_ids": req.pinned_product_ids,
-        "started_at": time.time(),
-    }
-    _live_metrics[live_id] = {
+        "live_type": req.live_type or "standard",
+        "pinned_product_ids": req.pinned_product_ids or [],
+        "started_at": None if req.scheduled_at else __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ),
+    })
+
+    # Initialiser les métriques temps-réel en mémoire/Redis
+    _live_metrics[str(live.id)] = {
         "concurrent_viewers": 0,
         "peak_viewers": 0,
         "total_gmv": 0.0,
@@ -66,15 +79,19 @@ async def create_live(req: CreateLiveRequest):
         "buy_now_count": 0,
         "comments": 0,
         "gifts_value": 0.0,
+        "started_at": time.time(),
     }
-    return {"live_id": live_id, "status": "created"}
+
+    return {"live_id": str(live.id), "status": "created"}
 
 
 @app.get("/api/v1/live/{live_id}/metrics", response_model=LiveMetricsResponse)
-async def get_live_metrics(live_id: str):
-    """Get current live metrics."""
+async def get_live_metrics(
+    live_id: str,
+    session: AsyncSession = Depends(get_db),
+):
+    """Get current live metrics — depuis Redis (temps-réel) + PG (persistant)."""
     metrics = _live_metrics.get(live_id, {})
-    # BUG #S5 FIX: get_viewer_count is now async (checks Redis)
     concurrent = await manager.get_viewer_count(live_id)
 
     return LiveMetricsResponse(
@@ -82,16 +99,17 @@ async def get_live_metrics(live_id: str):
         peak_viewers=metrics.get("peak_viewers", 0),
         total_gmv=metrics.get("total_gmv", 0.0),
         items_sold=metrics.get("items_sold", 0),
-        live_score=_compute_live_score(live_id),
+        live_score=_compute_live_score(live_id, concurrent),
     )
 
 
 def _compute_live_score(live_id: str, concurrent: int = 0) -> float:
-    """Section 07 — LiveScore formula, updated every 60s."""
+    """Section 07 — LiveScore formula."""
     m = _live_metrics.get(live_id, {})
     peak = m.get("peak_viewers", 0)
-
-    elapsed_min = max((time.time() - _live_sessions.get(live_id, {}).get("started_at", time.time())) / 60.0, 1.0)
+    elapsed_min = max(
+        (time.time() - m.get("started_at", time.time())) / 60.0, 1.0
+    )
     purchase_rate = m.get("buy_now_count", 0) / elapsed_min
     comment_rate = m.get("comments", 0) / elapsed_min
 
@@ -118,12 +136,14 @@ async def vendor_live_ws(websocket: WebSocket, live_id: str):
     try:
         while True:
             metrics = _live_metrics.get(live_id, {})
-            # BUG #S5 FIX: await async get_viewer_count
             concurrent = await manager.get_viewer_count(live_id)
 
-            # Update peak
             if concurrent > metrics.get("peak_viewers", 0):
                 metrics["peak_viewers"] = concurrent
+
+            elapsed_min = max(
+                (time.time() - metrics.get("started_at", time.time())) / 60.0, 1.0
+            )
 
             await websocket.send_json({
                 "event": "metrics_update",
@@ -131,9 +151,12 @@ async def vendor_live_ws(websocket: WebSocket, live_id: str):
                     "concurrent_viewers": concurrent,
                     "peak_viewers": metrics.get("peak_viewers", 0),
                     "gmv_live": metrics.get("total_gmv", 0.0),
-                    "buy_now_per_min": metrics.get("buy_now_count", 0) / max(1, (time.time() - _live_sessions.get(live_id, {}).get("started_at", time.time())) / 60.0),
+                    "buy_now_per_min": metrics.get("buy_now_count", 0) / elapsed_min,
                     "items_sold": metrics.get("items_sold", 0),
-                    "ctr_product": (metrics.get("product_clicks", 0) / max(1, concurrent)) if concurrent else 0,
+                    "ctr_product": (
+                        metrics.get("product_clicks", 0) / max(1, concurrent)
+                        if concurrent else 0
+                    ),
                     "live_score": _compute_live_score(live_id, concurrent),
                     "comments": metrics.get("comments", 0),
                 },
@@ -149,7 +172,7 @@ async def vendor_live_ws(websocket: WebSocket, live_id: str):
 
 @app.websocket("/ws/live/{live_id}/viewer")
 async def viewer_live_ws(websocket: WebSocket, live_id: str):
-    """Bidirectional WS for viewers: receive actions, push updates."""
+    """Bidirectional WS for viewers."""
     room = f"viewer_{live_id}"
     await manager.connect(websocket, room)
     logger.info("Viewer joined live=%s", live_id)
@@ -158,7 +181,6 @@ async def viewer_live_ws(websocket: WebSocket, live_id: str):
         while True:
             data = await websocket.receive_json()
             action = data.get("action", "")
-
             metrics = _live_metrics.setdefault(live_id, {})
 
             if action == "comment":

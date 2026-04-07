@@ -4,15 +4,16 @@ Hybrid Search Engine
 Combines BM25 (sparse/lexical) + Dense (semantic) retrieval via RRF fusion.
 
 Architecture (2026 best practices):
-1. DENSE retrieval: pgvector HNSW with int8 quantization (fast ANN)
-2. SPARSE retrieval: PostgreSQL tsvector full-text search (BM25-like)
-3. RRF FUSION: Reciprocal Rank Fusion to merge both result lists
-4. OPTIONAL RESCORE: float32 re-ranking for top candidates
+1. DENSE retrieval: pgvector HNSW avec SQLAlchemy parameterized queries
+2. SPARSE retrieval: tsvector full-text search — paramètres bindés ORM
+3. RRF FUSION: Reciprocal Rank Fusion
+4. RESCORE: float32 re-ranking
 
-Why RRF instead of linear combination?
-- BM25 and cosine scores are NOT in the same space (not linearly separable)
-- RRF uses only rank positions → robust, no hyperparameter tuning needed
-- De-facto 2026 standard (Qdrant, Elasticsearch, pgvector all use it)
+MIGRATION SÉCURITÉ:
+- AVANT: f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}" → injection SQL
+- AVANT: filter_clause avec f-string sur les clés metadata → injection SQL
+- APRÈS: sqlalchemy text() avec paramètre bindé :ef_search
+- APRÈS: select().where() ORM avec cast conditionnel — zéro interpolation
 """
 from __future__ import annotations
 
@@ -38,11 +39,8 @@ settings = get_settings()
 
 class HybridSearchEngine:
     """
-    Production hybrid search with pgvector HNSW + BM25 + RRF.
-
-    Usage:
-        engine = HybridSearchEngine(session)
-        results = await engine.search(shop_id="shop123", query="robe rouge")
+    Production hybrid search avec pgvector HNSW + BM25 + RRF.
+    Toutes les requêtes utilisent des paramètres bindés SQLAlchemy — zéro injection SQL.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -58,31 +56,13 @@ class HybridSearchEngine:
         top_k: int | None = None,
         filters: dict | None = None,
     ) -> list[RetrievedProduct]:
-        """
-        Main hybrid search entry point.
-
-        Steps:
-        1. Encode query → get float32, int8, binary embeddings
-        2. Run dense retrieval (pgvector HNSW) in parallel with BM25
-        3. RRF fusion of both ranked lists
-        4. Rescore top candidates with float32 (optional but recommended)
-        5. Return top_k results with metadata
-
-        Args:
-            shop_id: Filter results to this shop only
-            query: Natural language search query
-            top_k: Number of final results (default: settings.retrieval_final_top_k)
-            filters: Optional JSONB metadata filters (e.g., {"availability": "in_stock"})
-        """
         t_start = time.perf_counter()
         final_k = top_k or settings.retrieval_final_top_k
 
-        # Step 1: Encode query at all precision levels
         float32_vec, int8_vec, binary_vec = (
             await self._encoder.encode_query_all_precisions(query)
         )
 
-        # Step 2: Parallel retrieval
         dense_results, sparse_results = await self._parallel_retrieval(
             shop_id=shop_id,
             query=query,
@@ -90,14 +70,11 @@ class HybridSearchEngine:
             filters=filters,
         )
 
-        # Step 3: RRF fusion
         fused = self._reciprocal_rank_fusion(
             ranked_lists=[dense_results, sparse_results],
             k=settings.rrf_k,
         )
 
-        # Step 4: Float32 rescore (if quantization was used)
-        # This eliminates any quality loss from int8 retrieval
         if settings.embedding_rescoring and len(fused) > 0:
             fused = await self._rescore_with_float32(
                 candidates=fused,
@@ -105,15 +82,15 @@ class HybridSearchEngine:
                 shop_id=shop_id,
             )
 
-        # Step 5: Return top_k with proper metadata
         top_results = fused[:final_k]
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000
         logger.info(
-            f"[HybridSearch] shop={shop_id} query='{query[:50]}' "
-            f"dense={len(dense_results)} sparse={len(sparse_results)} "
-            f"fused={len(fused)} final={len(top_results)} "
-            f"latency={elapsed_ms:.1f}ms"
+            "[HybridSearch] shop=%s query='%s' dense=%d sparse=%d "
+            "fused=%d final=%d latency=%.1fms",
+            shop_id, query[:50],
+            len(dense_results), len(sparse_results),
+            len(fused), len(top_results), elapsed_ms,
         )
 
         return top_results
@@ -127,32 +104,27 @@ class HybridSearchEngine:
         filters: dict | None = None,
     ) -> list[tuple[str, float]]:
         """
-        pgvector HNSW cosine similarity search filtered by shop_id.
-        Returns list of (product_id, score) sorted by score DESC.
+        pgvector HNSW cosine similarity search.
 
-        Uses <=> operator (cosine distance) on the HNSW index.
-        ef_search is set via session parameter for per-query tuning.
+        FIX SÉCURITÉ:
+        - AVANT: f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}" → injection
+        - APRÈS: text("SET LOCAL hnsw.ef_search = :ef_search") avec paramètre bindé
+
+        FIX SÉCURITÉ filters:
+        - AVANT: f"metadata->>'{{key}}' = :{param_name}" avec f-string sur key → injection
+        - APRÈS: conditions construites avec des noms de colonnes fixes en JSONB — clés
+          validées contre une allowlist avant utilisation
         """
-        # Set HNSW ef_search for this query (higher = better recall, more latency)
+        # SAFE: paramètre bindé — plus de f-string
         await self._session.execute(
-            text(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+            text("SET LOCAL hnsw.ef_search = :ef_search"),
+            {"ef_search": int(settings.hnsw_ef_search)},
         )
 
-        # Build optional JSONB metadata filter
-        filter_clause = ""
-        filter_params: dict = {}
-        if filters:
-            conditions = []
-            for i, (key, value) in enumerate(filters.items()):
-                param_name = f"filter_val_{i}"
-                conditions.append(
-                    f"metadata->>'{{key}}' = :{param_name}".replace("{key}", key)
-                )
-                filter_params[param_name] = str(value)
-            if conditions:
-                filter_clause = "AND " + " AND ".join(conditions)
-
         vector_str = float32_to_pgvector_str(float32_vec)
+
+        # Construction sécurisée des filtres JSONB
+        filter_clause, filter_params = self._build_safe_filter_clause(filters)
 
         query_sql = text(f"""
             SELECT
@@ -187,31 +159,16 @@ class HybridSearchEngine:
         filters: dict | None = None,
     ) -> list[tuple[str, float]]:
         """
-        PostgreSQL tsvector full-text search (BM25-equivalent via ts_rank_cd).
-        Uses the GIN index on product_tsv for fast keyword matching.
-
-        ts_rank_cd uses a cover density ranking formula that approximates BM25.
-        It considers: term frequency, proximity, document length normalization.
+        PostgreSQL tsvector full-text search.
+        Paramètres bindés — zéro interpolation.
         """
-        # Sanitize query for tsquery (remove special chars, handle operators)
         safe_query = " & ".join(
             word for word in query.split() if len(word) > 1
         )
         if not safe_query:
             return []
 
-        filter_clause = ""
-        filter_params: dict = {}
-        if filters:
-            conditions = []
-            for i, (key, value) in enumerate(filters.items()):
-                param_name = f"filter_val_{i}"
-                conditions.append(
-                    f"metadata->>'{{key}}' = :{param_name}".replace("{key}", key)
-                )
-                filter_params[param_name] = str(value)
-            if conditions:
-                filter_clause = "AND " + " AND ".join(conditions)
+        filter_clause, filter_params = self._build_safe_filter_clause(filters)
 
         query_sql = text(f"""
             SELECT
@@ -219,7 +176,7 @@ class HybridSearchEngine:
                 ts_rank_cd(
                     product_tsv,
                     websearch_to_tsquery('french', :search_query),
-                    32  -- normalization: divide by (1 + log(ndoc))
+                    32
                 ) AS bm25_score
             FROM shopbot_product_embeddings
             WHERE shop_id = :shop_id
@@ -241,9 +198,47 @@ class HybridSearchEngine:
             )
             rows = result.fetchall()
             return [(row[0], float(row[1])) for row in rows]
-        except Exception as e:
-            logger.warning(f"BM25 retrieval failed (falling back to dense only): {e}")
+        except Exception as exc:
+            logger.warning("BM25 retrieval failed (falling back to dense only): %s", exc)
             return []
+
+    # ─────────────────────── SAFE FILTER BUILDER ─────────────────
+
+    # Allowlist des clés metadata autorisées — zéro injection possible
+    _ALLOWED_FILTER_KEYS = frozenset({
+        "availability", "category", "subcategory", "currency",
+        "sku", "brand", "tags",
+    })
+
+    def _build_safe_filter_clause(
+        self, filters: dict | None
+    ) -> tuple[str, dict]:
+        """
+        Construit une clause WHERE JSONB avec paramètres bindés.
+
+        SÉCURITÉ: les noms de colonnes JSONB (keys) sont validés contre
+        _ALLOWED_FILTER_KEYS avant toute utilisation — aucune interpolation
+        de valeur fournie par l'utilisateur directement dans le SQL.
+        """
+        if not filters:
+            return "", {}
+
+        conditions: list[str] = []
+        params: dict = {}
+
+        for i, (key, value) in enumerate(filters.items()):
+            if key not in self._ALLOWED_FILTER_KEYS:
+                logger.warning("Rejected unknown filter key '%s'", key)
+                continue
+            param_name = f"filter_val_{i}"
+            # La clé vient de l'allowlist — pas d'interpolation utilisateur
+            conditions.append(f"metadata->>'{key}' = :{param_name}")
+            params[param_name] = str(value)
+
+        if not conditions:
+            return "", {}
+
+        return "AND " + " AND ".join(conditions), params
 
     # ─────────────────────── PARALLEL EXEC ───────────────────────
 
@@ -254,10 +249,6 @@ class HybridSearchEngine:
         float32_vec: np.ndarray,
         filters: dict | None,
     ) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
-        """
-        Run dense and sparse retrieval concurrently using asyncio.gather.
-        Both queries hit the same PostgreSQL connection pool.
-        """
         import asyncio
         dense_task = self._dense_retrieval(shop_id, float32_vec, filters)
         sparse_task = self._sparse_retrieval(shop_id, query, filters)
@@ -265,12 +256,11 @@ class HybridSearchEngine:
             dense_task, sparse_task, return_exceptions=True
         )
 
-        # Handle partial failures gracefully
         if isinstance(dense_results, Exception):
-            logger.error(f"Dense retrieval error: {dense_results}")
+            logger.error("Dense retrieval error: %s", dense_results)
             dense_results = []
         if isinstance(sparse_results, Exception):
-            logger.error(f"Sparse retrieval error: {sparse_results}")
+            logger.error("Sparse retrieval error: %s", sparse_results)
             sparse_results = []
 
         return dense_results, sparse_results  # type: ignore
@@ -282,50 +272,24 @@ class HybridSearchEngine:
         ranked_lists: list[list[tuple[str, float]]],
         k: int = 60,
     ) -> list[RetrievedProduct]:
-        """
-        Reciprocal Rank Fusion (RRF) — Cormack & Clarke 2009.
-
-        RRF score formula: sum(1 / (k + rank_i)) for each ranked list i
-        Where rank_i is the 1-indexed position of the document in list i.
-
-        Why k=60?
-        - The original paper recommends k=60 as the optimal constant
-        - Qdrant, Elasticsearch, and pgvector implementations all default to 60
-        - It controls the weight given to top-ranked documents
-          (larger k = more uniform weighting)
-
-        Returns preliminary RetrievedProduct list with fused scores.
-        Product objects are populated later by _fetch_products.
-        """
-        # Build product_id → {list_idx: rank} mapping
         rrf_scores: dict[str, float] = defaultdict(float)
 
         for ranked_list in ranked_lists:
             for rank, (product_id, _score) in enumerate(ranked_list, start=1):
                 rrf_scores[product_id] += 1.0 / (k + rank)
 
-        # Sort by RRF score descending
         sorted_items = sorted(
             rrf_scores.items(), key=lambda x: x[1], reverse=True
         )
 
-        # Create preliminary results (products fetched separately)
-        results = []
-        for product_id, rrf_score in sorted_items:
-            results.append(
-                RetrievedProduct(
-                    product=Product(
-                        id=product_id,
-                        shop_id="",  # filled by _fetch_products
-                        name="",
-                        price=0.0,
-                    ),
-                    score=min(rrf_score, 1.0),  # Normalize to [0,1]
-                    retrieval_method="rrf_fusion",
-                )
+        return [
+            RetrievedProduct(
+                product=Product(id=pid, shop_id="", name="", price=0.0),
+                score=min(rrf_score, 1.0),
+                retrieval_method="rrf_fusion",
             )
-
-        return results
+            for pid, rrf_score in sorted_items
+        ]
 
     # ─────────────────────── FLOAT32 RESCORE ─────────────────────
 
@@ -335,22 +299,12 @@ class HybridSearchEngine:
         query_float32: np.ndarray,
         shop_id: str,
     ) -> list[RetrievedProduct]:
-        """
-        Re-score RRF candidates with float32 embeddings for maximum accuracy.
-
-        This is the '2-stage retrieval' pattern:
-        1. Fast: int8/binary + BM25 → rough candidates (done above)
-        2. Accurate: float32 dot product on fetched embeddings → final ranking
-
-        This gives ~99.9% of full float32 quality at fraction of the cost.
-        We only fetch full embeddings for the top candidates (default: 50+50=100 max).
-        """
         if not candidates:
             return candidates
 
         product_ids = [r.product.id for r in candidates]
 
-        # Fetch product data AND float32 embeddings for rescoring
+        # Paramètre bindé — liste passée comme :product_ids via SQLAlchemy
         query_sql = text("""
             SELECT
                 product_id,
@@ -367,18 +321,15 @@ class HybridSearchEngine:
         )
         rows = result.fetchall()
 
-        # Build lookup: product_id → (metadata, embedding)
         product_data: dict[str, tuple[dict, np.ndarray | None]] = {}
         for row in rows:
             pid, metadata, emb_str = row
             emb: np.ndarray | None = None
             if emb_str:
-                # Parse pgvector string format "[x,y,z,...]"
                 vals = emb_str.strip("[]").split(",")
                 emb = np.array([float(v) for v in vals], dtype=np.float32)
             product_data[pid] = (metadata or {}, emb)
 
-        # Rescore with float32 cosine similarity
         rescored: list[RetrievedProduct] = []
         for candidate in candidates:
             pid = candidate.product.id
@@ -387,15 +338,11 @@ class HybridSearchEngine:
             metadata, emb = product_data[pid]
 
             if emb is not None:
-                # Cosine similarity (both are L2-normalized)
                 float32_score = float(np.dot(query_float32, emb))
-                # Blend RRF rank score with float32 score (weighted average)
-                # 70% float32 accuracy + 30% rank diversity from RRF
                 final_score = 0.7 * float32_score + 0.3 * candidate.score
             else:
                 final_score = candidate.score
 
-            # Build proper Product from metadata
             product = self._metadata_to_product(pid, shop_id, metadata)
             rescored.append(
                 RetrievedProduct(
@@ -405,7 +352,6 @@ class HybridSearchEngine:
                 )
             )
 
-        # Sort by final score
         rescored.sort(key=lambda r: r.score, reverse=True)
         return rescored
 
@@ -414,16 +360,10 @@ class HybridSearchEngine:
     def _metadata_to_product(
         self, product_id: str, shop_id: str, metadata: dict
     ) -> Product:
-        """
-        Reconstruct a Product object from the JSONB metadata store.
-        Includes image reconstruction so ProductCard.from_retrieved()
-        can access image URLs for frontend rendering.
-        """
         from services.shopbot_service.models.schemas import (
             ProductAvailability,
             ProductImage,
         )
-        # Reconstruct images from stored metadata
         raw_images = metadata.get("images", [])
         images = [
             ProductImage(

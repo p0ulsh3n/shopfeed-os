@@ -24,7 +24,8 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.shopbot_service.bot.guardrails import (
@@ -369,15 +370,26 @@ class ShopBot:
     async def _load_history(
         self, session_id: str, shop_id: str
     ) -> list[ChatMessage]:
+        """
+        Charge l'historique de session depuis ShopbotSessionORM.
+
+        MIGRATION:
+        - AVANT: text("SELECT history FROM shopbot_sessions WHERE session_id = :sid")
+          → text() paramétré correct MAIS hors ORM
+        - APRÈS: select(ShopbotSessionORM).where(...) — ORM pur, zéro SQL brut
+        """
+        from datetime import datetime, timezone
+        from services.shopbot_service.retrieval.catalog_sync import ShopbotSessionORM
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                text("""
-                    SELECT history FROM shopbot_sessions
-                    WHERE session_id = :session_id
-                      AND shop_id = :shop_id
-                      AND expires_at > NOW()
-                """),
-                {"session_id": session_id, "shop_id": shop_id},
+                select(ShopbotSessionORM.history)
+                .where(
+                    ShopbotSessionORM.session_id == session_id,
+                    ShopbotSessionORM.shop_id == shop_id,
+                    ShopbotSessionORM.expires_at > datetime.now(timezone.utc),
+                )
+                .limit(1)
             )
             row = result.fetchone()
 
@@ -389,61 +401,80 @@ class ShopBot:
                 ChatMessage(**m)
                 for m in raw[-(settings.max_history_turns * 2):]
             ]
-        except Exception as e:
-            logger.warning(f"Failed to parse session history: {e}")
+        except Exception as exc:
+            logger.warning("Failed to parse session history: %s", exc)
             return []
 
     async def _save_history(
         self, session_id: str, shop_id: str, history: list[ChatMessage]
     ) -> None:
+        """
+        Persiste la session via pg_insert ON CONFLICT DO UPDATE — ORM pur.
+
+        MIGRATION:
+        - AVANT: text("INSERT INTO shopbot_sessions ... ON CONFLICT ...") — SQL brut
+        - APRÈS: pg_insert(ShopbotSessionORM).on_conflict_do_update() — ORM
+        """
+        from datetime import datetime, timedelta, timezone
+        from services.shopbot_service.retrieval.catalog_sync import ShopbotSessionORM
+
         max_turns = settings.max_history_turns * 2
         truncated = history[-max_turns:]
-        history_json = json.dumps([m.model_dump(mode="json") for m in truncated])
+        history_data = [m.model_dump(mode="json") for m in truncated]
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(hours=24)
 
         async with AsyncSessionLocal() as session:
-            await session.execute(
-                text("""
-                    INSERT INTO shopbot_sessions
-                        (session_id, shop_id, history, expires_at)
-                    VALUES
-                        (:session_id, :shop_id, :history::jsonb,
-                         NOW() + INTERVAL '24 hours')
-                    ON CONFLICT (session_id) DO UPDATE SET
-                        history    = EXCLUDED.history,
-                        updated_at = NOW(),
-                        expires_at = NOW() + INTERVAL '24 hours'
-                """),
-                {
-                    "session_id": session_id,
-                    "shop_id": shop_id,
-                    "history": history_json,
-                },
+            stmt = (
+                pg_insert(ShopbotSessionORM)
+                .values(
+                    session_id=session_id,
+                    shop_id=shop_id,
+                    history=history_data,
+                    created_at=now,
+                    updated_at=now,
+                    expires_at=expires,
+                )
+                .on_conflict_do_update(
+                    index_elements=["session_id"],
+                    set_={
+                        "history": pg_insert(ShopbotSessionORM).excluded.history,
+                        "updated_at": now,
+                        "expires_at": expires,
+                    },
+                )
             )
+            await session.execute(stmt)
             await session.commit()
 
     # ─────────────────────── SHOP INFO ───────────────────────────
 
     async def _get_shop_info(self, shop_id: str) -> str:
         """
-        Fetch shop name from the main DB.
-        Returns shop display name only.
-        The bot auto-detects and responds in the CLIENT's language,
-        not a shop-level language (the shop serves an international audience).
+        Fetch shop name via VendorORM.shop_name.
+
+        MIGRATION:
+        - AVANT: text("SELECT name FROM shops WHERE id = :shop_id") — SQL brut
+        - APRÈS: select(VendorORM.shop_name).where(VendorORM.id == uid) — ORM
+        Note: ShopFeed n'a pas de table 'shops' séparée — le shop_name
+        est sur VendorORM. Si le shop_id est un UUID Vendor valide, on retourne
+        VendorORM.shop_name, sinon 'the shop'.
         """
+        import uuid as _uuid
+        from shared.db.models.vendor import VendorORM
+
         async with AsyncSessionLocal() as session:
             try:
+                vendor_uuid = _uuid.UUID(str(shop_id))
                 result = await session.execute(
-                    text("""
-                        SELECT name FROM shops
-                        WHERE id = :shop_id
-                        LIMIT 1
-                    """),
-                    {"shop_id": shop_id},
+                    select(VendorORM.shop_name)
+                    .where(VendorORM.id == vendor_uuid)
+                    .limit(1)
                 )
                 row = result.fetchone()
                 if row and row[0]:
                     return str(row[0])
-            except Exception as e:
-                logger.warning(f"Could not fetch shop info for {shop_id}: {e}")
+            except (ValueError, Exception) as exc:
+                logger.warning("Could not fetch shop info for %s: %s", shop_id, exc)
 
         return "the shop"

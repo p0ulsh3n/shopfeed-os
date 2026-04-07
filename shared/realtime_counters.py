@@ -428,41 +428,41 @@ class CounterSyncService:
 
     async def _upsert_to_db(
         self,
-        db_pool,
+        db_pool,  # gardé pour compatibilité signature, non utilisé
         content_id: str,
         counters: dict[str, str],
         scores: dict[str, str],
     ) -> None:
-        """Upsert counters into feed_videos table."""
+        """
+        Flush compteurs Redis → table feed_videos via SQLAlchemy ORM.
+
+        MIGRATION SÉCURITÉ:
+        - AVANT: asyncpg conn.execute("UPDATE feed_videos SET ... WHERE id = $1", ...)
+          → SQL brut, pool asyncpg directe, pas de session SQLAlchemy
+        - APRÈS: AnalyticsRepository.upsert_feed_video_counters() via pg_insert
+          ON CONFLICT DO UPDATE — 100% ORM, zéro SQL brut
+        """
+        from shared.db.session import AsyncSessionLocal
+        from shared.repositories.analytics_repository import AnalyticsRepository
+
+        _repo = AnalyticsRepository()
+        data = {
+            "total_views": int(counters.get("views", 0)),
+            "total_likes": int(counters.get("likes", 0)),
+            "total_shares": int(counters.get("shares", 0)),
+            "total_add_to_cart": int(counters.get("cart", 0)),
+            "total_purchases": int(counters.get("purchases", 0)),
+            "gmv_attributed": float(counters.get("gmv_attributed", 0)),
+            "score_cvr": float(scores.get("score_cvr", 0)),
+            "score_watch_time": float(scores.get("score_watch_time", 0)),
+            "score_engagement": float(scores.get("score_engagement", 0)),
+        }
         try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE feed_videos SET
-                        total_views = $2,
-                        total_likes = $3,
-                        total_shares = $4,
-                        total_add_to_cart = $5,
-                        total_purchases = $6,
-                        gmv_attributed = $7,
-                        score_cvr = $8,
-                        score_watch_time = $9,
-                        score_engagement = $10
-                    WHERE id = $1
-                    """,
-                    content_id,
-                    int(counters.get("views", 0)),
-                    int(counters.get("likes", 0)),
-                    int(counters.get("shares", 0)),
-                    int(counters.get("cart", 0)),
-                    int(counters.get("purchases", 0)),
-                    float(counters.get("gmv_attributed", 0)),
-                    float(scores.get("score_cvr", 0)),
-                    float(scores.get("score_watch_time", 0)),
-                    float(scores.get("score_engagement", 0)),
-                )
-        except Exception as e:
-            logger.warning("DB upsert failed for %s: %s", content_id, e)
+            async with AsyncSessionLocal() as session:
+                await _repo.upsert_feed_video_counters(session, content_id, data)
+                await session.commit()
+        except Exception as exc:
+            logger.warning("ORM upsert failed for %s: %s", content_id, exc)
 
     def stop(self) -> None:
         self._running = False

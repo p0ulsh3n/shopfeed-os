@@ -31,11 +31,14 @@ pillow>=10.4.0
 # ── Vector Search ───────────────────────────────────────
 faiss-cpu>=1.9.0         # CPU FAISS (use faiss-gpu on GPU servers)
 
-# ── Async Database ──────────────────────────────────────
-asyncpg>=0.30.0          # PostgreSQL async
-redis[hiredis]>=5.2.0    # Redis with C parser
-aiokafka>=0.12.0         # Kafka async producer/consumer
-pgvector>=0.3.0          # PostgreSQL pgvector extension
+# ── Async Database ──────────────────────────────────────────────
+sqlalchemy[asyncio]>=2.0.36  # ORM async — remplace tout SQL brut
+alembic>=1.14.0              # Migrations versionnées (remplace DDL inline)
+asyncpg>=0.30.0              # Driver PostgreSQL async (backend SQLAlchemy + LISTEN/NOTIFY)
+greenlet>=3.1.0              # Requis par SQLAlchemy asyncio
+redis[hiredis]>=5.2.0        # Redis with C parser
+aiokafka>=0.12.0             # Kafka async producer/consumer
+pgvector>=0.3.0              # PostgreSQL pgvector extension
 
 # ── Search ──────────────────────────────────────────────
 elasticsearch[async]>=8.16.0

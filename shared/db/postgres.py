@@ -1,27 +1,42 @@
-"""PostgreSQL connection factory — async with graceful fallback."""
+"""
+shared/db/postgres.py
+======================
+MIGRATION complète : asyncpg brut → SQLAlchemy 2.0.
 
+Ce module est désormais un simple re-export vers shared.db.session.
+Il existait avant pour fournir un pool asyncpg directement.
+Maintenant, tout passe par SQLAlchemy AsyncSessionLocal.
+
+Compatibilité : les imports existants `from shared.db.postgres import get_db_pool`
+sont redirigés via les fonctions de compatibilité ci-dessous.
+"""
 from __future__ import annotations
 
 import logging
-import os
+
+from shared.db.session import check_db_health, engine
 
 logger = logging.getLogger(__name__)
 
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://shopfeed:shopfeed@localhost:5432/shopfeed")
 
-_pg_pool = None
+async def get_db_pool():
+    """
+    DEPRECATED — Utiliser `from shared.db.session import get_db` à la place.
+    Retourne None et log un warning pour guider la migration.
+    """
+    logger.warning(
+        "get_db_pool() is deprecated — use 'from shared.db.session import get_db' "
+        "with FastAPI Depends(get_db) or get_db_session() context manager instead."
+    )
+    return None
 
 
-async def get_pg_pool():
-    """Get or create async PostgreSQL connection pool."""
-    global _pg_pool
-    if _pg_pool is not None:
-        return _pg_pool
-    try:
-        import asyncpg
-        _pg_pool = await asyncpg.create_pool(POSTGRES_DSN, min_size=2, max_size=20)
-        logger.info("PostgreSQL pool created: %s", POSTGRES_DSN.split("@")[-1])
-        return _pg_pool
-    except Exception as exc:
-        logger.warning("PostgreSQL unavailable (%s)", exc)
-        return None
+async def release_db_pool():
+    """DEPRECATED — Le pool SQLAlchemy est géré automatiquement par l'engine."""
+    pass
+
+
+# Health check — proxied vers SQLAlchemy engine
+health_check = check_db_health
+
+__all__ = ["get_db_pool", "release_db_pool", "health_check"]

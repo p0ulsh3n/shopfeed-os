@@ -1,22 +1,28 @@
-"""Database connection factories — PostgreSQL, Redis, Kafka.
-
-Each factory is lazy, async, and supports graceful fallback
-when infrastructure is unavailable (dev/test mode).
 """
+shared/db/__init__.py
+Expose les points d'entrée principaux de la couche DB.
+Usage : `from shared.db import get_db, engine`
+"""
+from shared.db.session import (
+    AsyncSessionLocal,
+    check_db_health,
+    close_engine,
+    engine,
+    get_db,
+    get_db_session,
+)
 
-from .kafka import LogKafkaProducer, get_kafka_producer, publish_event
-from .postgres import get_pg_pool
-from .redis import InMemoryPipeline, InMemoryRedis, get_redis
+# Kafka + Redis restent dans leurs modules séparés
+from shared.db.kafka import get_kafka_producer
+from shared.db.redis import get_redis_client
 
 __all__ = [
-    # Redis
-    "get_redis",
-    "InMemoryRedis",
-    "InMemoryPipeline",
-    # Kafka
+    "engine",
+    "AsyncSessionLocal",
+    "get_db",
+    "get_db_session",
+    "check_db_health",
+    "close_engine",
     "get_kafka_producer",
-    "publish_event",
-    "LogKafkaProducer",
-    # PostgreSQL
-    "get_pg_pool",
+    "get_redis_client",
 ]

@@ -7,9 +7,14 @@ No polling — zero-latency sync via asyncpg LISTEN.
 Strategy:
 - FULL SYNC: On startup or manual trigger — indexes all products for a shop
 - INCREMENTAL SYNC: Via LISTEN/NOTIFY — handles INSERT/UPDATE/DELETE in real-time
-- BATCH UPSERT: Efficient bulk insert using asyncpg's executemany
+- BATCH UPSERT: pg_insert ON CONFLICT DO UPDATE via SQLAlchemy ORM
 
-This ensures the ShopBot NEVER serves stale product data.
+MIGRATION:
+- AVANT: session.execute(text("INSERT INTO shopbot_product_embeddings ..."))
+  → SQL brut inline dans le code applicatif
+- APRÈS: ShopbotProductEmbeddingRepository avec pg_insert ON CONFLICT DO UPDATE
+  → ORM SQLAlchemy 2.0, paramètres bindés, zéro SQL brut
+- GARDÉ: asyncpg LISTEN/NOTIFY (justifié — SQLAlchemy ne supporte pas LISTEN nativement)
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 import numpy as np
-from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.shopbot_service.config import get_settings
@@ -43,6 +48,73 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+# ─────────────────────── ORM Table Reference ─────────────────────
+# On importe la table via SQLAlchemy core pour les pg_insert.
+# Les modèles ORM shopbot sont locaux au service (pas dans shared/db/models).
+# Ils seront créés par Alembic depuis ces classes.
+
+from sqlalchemy import Column, String, DateTime, Text, BigInteger, Integer
+from sqlalchemy.dialects.postgresql import BYTEA, JSONB, UUID as PG_UUID
+from sqlalchemy.orm import DeclarativeBase
+
+from services.shopbot_service.database.connection import Base
+
+
+class ShopbotProductEmbeddingORM(Base):
+    """
+    ORM model pour shopbot_product_embeddings.
+    Alembic génère la migration depuis ce modèle.
+    """
+    __tablename__ = "shopbot_product_embeddings"
+    __table_args__ = {"extend_existing": True}
+
+    from sqlalchemy import UniqueConstraint
+    import uuid as _uuid
+
+    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=_uuid.uuid4)
+    shop_id = Column(String(100), nullable=False, index=True)
+    product_id = Column(String(100), nullable=False)
+    product_text = Column(Text, nullable=False)
+    embedding_float32 = Column(Text, nullable=True)   # pgvector stocké comme text
+    embedding_int8 = Column(BYTEA, nullable=True)
+    embedding_binary = Column(BYTEA, nullable=True)
+    metadata_ = Column("metadata", JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class ShopbotSyncLogORM(Base):
+    """ORM model pour shopbot_sync_log."""
+    __tablename__ = "shopbot_sync_log"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    shop_id = Column(String(100), nullable=False)
+    sync_type = Column(String(30), nullable=False)
+    products_count = Column(Integer, nullable=False, default=0)
+    status = Column(String(30), nullable=False)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ShopbotSessionORM(Base):
+    """ORM model pour shopbot_sessions."""
+    __tablename__ = "shopbot_sessions"
+    __table_args__ = {"extend_existing": True}
+
+    import uuid as _uuid2
+    session_id = Column(String(200), primary_key=True)
+    shop_id = Column(String(100), nullable=False, index=True)
+    customer_id = Column(String(200), nullable=True)
+    history = Column(JSONB, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# ─────────────────────── Catalog Sync Service ────────────────────
+
 class CatalogSyncService:
     """
     Manages real-time and bulk synchronization of shop catalogs
@@ -59,27 +131,25 @@ class CatalogSyncService:
         self._encoder = EmbeddingEncoder.get_instance()
         self._listener_task: asyncio.Task | None = None
         self._running = False
-        self._processing_semaphore = asyncio.Semaphore(4)  # Max 4 concurrent syncs
+        self._processing_semaphore = asyncio.Semaphore(4)
 
     # ─────────────────────── LIFECYCLE ───────────────────────────
 
     async def start_listener(self) -> None:
         """
         Start the background LISTEN task.
-        Connects to PostgreSQL and listens on catalog_notify_channel.
-        Auto-reconnects on connection loss.
+        asyncpg LISTEN utilisé ici car SQLAlchemy ne supporte pas LISTEN nativement.
         """
         self._running = True
         self._listener_task = asyncio.create_task(
             self._listen_loop(), name="shopbot-catalog-listener"
         )
         logger.info(
-            f"Catalog sync listener started "
-            f"[channel={settings.catalog_notify_channel}]"
+            "Catalog sync listener started [channel=%s]",
+            settings.catalog_notify_channel,
         )
 
     async def stop(self) -> None:
-        """Gracefully stop the listener."""
         self._running = False
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
@@ -94,7 +164,7 @@ class CatalogSyncService:
     async def _listen_loop(self) -> None:
         """
         Persistent LISTEN loop with auto-reconnect.
-        Uses asyncpg directly (not SQLAlchemy) for LISTEN/NOTIFY support.
+        asyncpg JUSTIFIÉ ici — seule utilisation légitime de la pool brute.
         """
         backoff = 1
         while self._running:
@@ -105,25 +175,20 @@ class CatalogSyncService:
                         settings.catalog_notify_channel,
                         self._on_notification,
                     )
-                    logger.info(
-                        f"Listening on channel: {settings.catalog_notify_channel}"
-                    )
-                    backoff = 1  # Reset backoff on successful connect
+                    logger.info("Listening on channel: %s", settings.catalog_notify_channel)
+                    backoff = 1
 
-                    # Keep the connection alive
                     while self._running:
                         await asyncio.sleep(5)
-                        # Heartbeat to detect dead connections
+                        # Heartbeat — connexion asyncpg maintenue pour LISTEN
                         await conn.execute("SELECT 1")
 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(
-                    f"Catalog listener error (retrying in {backoff}s): {e}"
-                )
+            except Exception as exc:
+                logger.error("Catalog listener error (retrying in %ds): %s", backoff, exc)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)  # Exponential backoff, max 60s
+                backoff = min(backoff * 2, 60)
 
     async def _on_notification(
         self,
@@ -132,52 +197,34 @@ class CatalogSyncService:
         channel: str,
         payload: str,
     ) -> None:
-        """
-        Callback fired when PostgreSQL sends a NOTIFY.
-        Parses the JSON payload and dispatches to the appropriate handler.
-        """
         try:
             data = json.loads(payload)
             event = CatalogEvent(**data)
             logger.debug(
-                f"Catalog event: {event.event_type} "
-                f"shop={event.shop_id} product={event.product_id}"
+                "Catalog event: %s shop=%s product=%s",
+                event.event_type, event.shop_id, event.product_id,
             )
-
-            # Schedule processing without blocking the listener
             asyncio.create_task(
                 self._process_event(event),
                 name=f"shopbot-sync-{event.product_id[:8]}",
             )
-
-        except Exception as e:
-            logger.error(f"Failed to process catalog notification: {e}")
+        except Exception as exc:
+            logger.error("Failed to process catalog notification: %s", exc)
 
     async def _process_event(self, event: CatalogEvent) -> None:
-        """Process a single catalog event with semaphore-limited concurrency."""
         async with self._processing_semaphore:
             try:
                 if event.event_type == CatalogEventType.DELETE:
-                    await self._delete_product_from_index(
-                        event.shop_id, event.product_id
-                    )
-                elif event.event_type in (
-                    CatalogEventType.INSERT, CatalogEventType.UPDATE
-                ):
+                    await self._delete_product_from_index(event.shop_id, event.product_id)
+                elif event.event_type in (CatalogEventType.INSERT, CatalogEventType.UPDATE):
                     if event.product_data:
                         await self._upsert_product_to_index(
                             event.shop_id, event.product_id, event.product_data
                         )
-                    else:
-                        # Fetch from DB if payload was truncated
-                        logger.warning(
-                            f"No product data in event for {event.product_id}, "
-                            f"fetching from DB..."
-                        )
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    f"Failed to process event "
-                    f"{event.event_type} {event.product_id}: {e}"
+                    "Failed to process event %s %s: %s",
+                    event.event_type, event.product_id, exc,
                 )
 
     # ─────────────────────── FULL SYNC ───────────────────────────
@@ -188,55 +235,37 @@ class CatalogSyncService:
         products: list[Product],
         force_rebuild: bool = False,
     ) -> CatalogSyncResponse:
-        """
-        Full catalog re-indexing for a shop.
-        Called on:
-        - First-time shop onboarding
-        - Manual sync trigger (POST /catalog/sync)
-        - Recovery after missed events
-
-        Steps:
-        1. Optionally clear existing embeddings for this shop
-        2. Batch encode all products (parallel)
-        3. Bulk upsert into shopbot_product_embeddings
-        """
         t_start = datetime.now(timezone.utc)
         indexed = 0
         failed = 0
 
         logger.info(
-            f"Starting full sync for shop={shop_id} "
-            f"products={len(products)} force={force_rebuild}"
+            "Starting full sync for shop=%s products=%d force=%s",
+            shop_id, len(products), force_rebuild,
         )
 
         if force_rebuild:
             await self._clear_shop_index(shop_id)
 
-        # Process in batches to avoid memory overflow
         batch_size = settings.sync_batch_size
         for batch_start in range(0, len(products), batch_size):
             batch = products[batch_start: batch_start + batch_size]
             try:
                 batch_indexed = await self._upsert_product_batch(shop_id, batch)
                 indexed += batch_indexed
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    f"Batch sync failed for shop={shop_id} "
-                    f"batch={batch_start}: {e}"
+                    "Batch sync failed for shop=%s batch=%d: %s",
+                    shop_id, batch_start, exc,
                 )
                 failed += len(batch)
 
-        duration_ms = (
-            datetime.now(timezone.utc) - t_start
-        ).total_seconds() * 1000
-
-        # Log to sync table
+        duration_ms = (datetime.now(timezone.utc) - t_start).total_seconds() * 1000
         await self._log_sync(shop_id, "full", indexed, failed, duration_ms)
 
         logger.info(
-            f"Full sync complete: shop={shop_id} "
-            f"indexed={indexed} failed={failed} "
-            f"duration={duration_ms:.0f}ms"
+            "Full sync complete: shop=%s indexed=%d failed=%d duration=%.0fms",
+            shop_id, indexed, failed, duration_ms,
         )
 
         return CatalogSyncResponse(
@@ -247,25 +276,26 @@ class CatalogSyncService:
             status="success" if failed == 0 else "partial",
         )
 
-    # ─────────────────────── UPSERT BATCH ────────────────────────
+    # ─────────────────────── UPSERT BATCH (ORM) ──────────────────
 
     async def _upsert_product_batch(
         self, shop_id: str, products: list[Product]
     ) -> int:
         """
         Encode and upsert a batch of products.
-        Returns number of successfully indexed products.
+
+        MIGRATION:
+        - AVANT: session.execute(text("INSERT INTO shopbot_product_embeddings ... ON CONFLICT ..."))
+          → SQL brut inline
+        - APRÈS: pg_insert(ShopbotProductEmbeddingORM).on_conflict_do_update(...)
+          → SQLAlchemy dialects.postgresql.insert — paramètres bindés, zéro SQL brut
         """
-        # Prepare texts for batch encoding
         product_texts = [p.to_text_for_embedding() for p in products]
         bm25_texts = [p.to_bm25_text() for p in products]
 
-        # Batch encode (runs in thread pool)
-        float32_embeddings, _, _ = await self._encoder.encode_passages_batch(
-            product_texts
-        )
+        float32_embeddings, _, _ = await self._encoder.encode_passages_batch(product_texts)
 
-        # Prepare metadata JSONB for each product
+        now = datetime.now(timezone.utc)
         records = []
         for i, product in enumerate(products):
             emb_vec = float32_embeddings[i]
@@ -275,29 +305,27 @@ class CatalogSyncService:
                 "shop_id": shop_id,
                 "product_id": product.id,
                 "product_text": bm25_texts[i],
-                "embedding_vector": float32_to_pgvector_str(emb_vec),
+                "embedding_float32": float32_to_pgvector_str(emb_vec),
                 "metadata": json.dumps(metadata),
+                "created_at": now,
+                "updated_at": now,
             })
 
-        # Bulk upsert via SQLAlchemy
         async with AsyncSessionLocal() as session:
-            for record in records:
-                await session.execute(
-                    text("""
-                        INSERT INTO shopbot_product_embeddings
-                            (shop_id, product_id, product_text,
-                             embedding_float32, metadata)
-                        VALUES
-                            (:shop_id, :product_id, :product_text,
-                             :embedding_vector::vector, :metadata::jsonb)
-                        ON CONFLICT (shop_id, product_id) DO UPDATE SET
-                            product_text      = EXCLUDED.product_text,
-                            embedding_float32 = EXCLUDED.embedding_float32,
-                            metadata          = EXCLUDED.metadata,
-                            updated_at        = NOW()
-                    """),
-                    record,
+            stmt = (
+                pg_insert(ShopbotProductEmbeddingORM)
+                .values(records)
+                .on_conflict_do_update(
+                    index_elements=["shop_id", "product_id"],
+                    set_={
+                        "product_text": pg_insert(ShopbotProductEmbeddingORM).excluded.product_text,
+                        "embedding_float32": pg_insert(ShopbotProductEmbeddingORM).excluded.embedding_float32,
+                        "metadata": pg_insert(ShopbotProductEmbeddingORM).excluded.metadata,
+                        "updated_at": now,
+                    },
                 )
+            )
+            await session.execute(stmt)
             await session.commit()
 
         return len(records)
@@ -305,50 +333,53 @@ class CatalogSyncService:
     async def _upsert_product_to_index(
         self, shop_id: str, product_id: str, product_data: dict
     ) -> None:
-        """
-        Single-product upsert from a NOTIFY event.
-        Triggered by INSERT or UPDATE on the products table.
-        """
+        """Single-product upsert from a NOTIFY event."""
         product = self._event_data_to_product(product_id, shop_id, product_data)
         await self._upsert_product_batch(shop_id, [product])
-        logger.debug(f"Upserted product {product_id} for shop {shop_id}")
+        logger.debug("Upserted product %s for shop %s", product_id, shop_id)
 
-    # ─────────────────────── DELETE ──────────────────────────────
+    # ─────────────────────── DELETE (ORM) ────────────────────────
 
-    async def _delete_product_from_index(
-        self, shop_id: str, product_id: str
-    ) -> None:
+    async def _delete_product_from_index(self, shop_id: str, product_id: str) -> None:
         """
         Remove a product from the vector index.
-        Called when a product is deleted from the main catalog.
+
+        MIGRATION:
+        - AVANT: session.execute(text("DELETE FROM shopbot_product_embeddings WHERE ..."))
+        - APRÈS: session.execute(delete(ShopbotProductEmbeddingORM).where(...))
         """
+        from sqlalchemy import delete
+
         async with AsyncSessionLocal() as session:
             await session.execute(
-                text("""
-                    DELETE FROM shopbot_product_embeddings
-                    WHERE shop_id = :shop_id AND product_id = :product_id
-                """),
-                {"shop_id": shop_id, "product_id": product_id},
+                delete(ShopbotProductEmbeddingORM).where(
+                    ShopbotProductEmbeddingORM.shop_id == shop_id,
+                    ShopbotProductEmbeddingORM.product_id == product_id,
+                )
             )
             await session.commit()
-        logger.debug(f"Deleted product {product_id} from shop {shop_id} index")
+        logger.debug("Deleted product %s from shop %s index", product_id, shop_id)
 
     async def _clear_shop_index(self, shop_id: str) -> None:
         """Remove ALL product embeddings for a shop (used on full rebuild)."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                text("""
-                    DELETE FROM shopbot_product_embeddings
-                    WHERE shop_id = :shop_id
-                    RETURNING product_id
-                """),
-                {"shop_id": shop_id},
-            )
-            count = len(result.fetchall())
-            await session.commit()
-        logger.info(f"Cleared {count} embeddings for shop={shop_id}")
+        from sqlalchemy import delete, func, select
 
-    # ─────────────────────── SYNC LOG ────────────────────────────
+        async with AsyncSessionLocal() as session:
+            count_result = await session.execute(
+                select(func.count()).where(
+                    ShopbotProductEmbeddingORM.shop_id == shop_id
+                )
+            )
+            count = count_result.scalar_one()
+            await session.execute(
+                delete(ShopbotProductEmbeddingORM).where(
+                    ShopbotProductEmbeddingORM.shop_id == shop_id
+                )
+            )
+            await session.commit()
+        logger.info("Cleared %d embeddings for shop=%s", count, shop_id)
+
+    # ─────────────────────── SYNC LOG (ORM) ──────────────────────
 
     async def _log_sync(
         self,
@@ -358,29 +389,30 @@ class CatalogSyncService:
         failed: int,
         duration_ms: float,
     ) -> None:
-        """Write sync result to the shopbot_sync_log table."""
+        """
+        Write sync result to shopbot_sync_log.
+
+        MIGRATION:
+        - AVANT: session.execute(text("INSERT INTO shopbot_sync_log ..."))
+        - APRÈS: session.add(ShopbotSyncLogORM(...)) — ORM pur
+        """
         status = "success" if failed == 0 else ("failed" if indexed == 0 else "partial")
+        now = datetime.now(timezone.utc)
+
         async with AsyncSessionLocal() as session:
-            await session.execute(
-                text("""
-                    INSERT INTO shopbot_sync_log
-                        (shop_id, sync_type, products_count, status, completed_at)
-                    VALUES
-                        (:shop_id, :sync_type, :count, :status, NOW())
-                """),
-                {
-                    "shop_id": shop_id,
-                    "sync_type": sync_type,
-                    "count": indexed + failed,
-                    "status": status,
-                },
-            )
+            session.add(ShopbotSyncLogORM(
+                shop_id=shop_id,
+                sync_type=sync_type,
+                products_count=indexed + failed,
+                status=status,
+                started_at=now,
+                completed_at=now,
+            ))
             await session.commit()
 
     # ─────────────────────── HELPERS ─────────────────────────────
 
     def _product_to_metadata(self, product: Product) -> dict:
-        """Serialize product to JSONB metadata for storage."""
         return {
             "name": product.name,
             "description": product.description,
@@ -402,7 +434,6 @@ class CatalogSyncService:
     def _event_data_to_product(
         self, product_id: str, shop_id: str, data: dict
     ) -> Product:
-        """Convert raw NOTIFY event data to a Product object."""
         from services.shopbot_service.models.schemas import ProductAvailability
         return Product(
             id=product_id,
@@ -414,9 +445,7 @@ class CatalogSyncService:
             category=data.get("category"),
             subcategory=data.get("subcategory"),
             tags=data.get("tags", []),
-            availability=ProductAvailability(
-                data.get("availability", "in_stock")
-            ),
+            availability=ProductAvailability(data.get("availability", "in_stock")),
             stock_quantity=data.get("stock_quantity"),
             sku=data.get("sku"),
             attributes=data.get("attributes", {}),

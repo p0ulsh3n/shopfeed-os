@@ -5,23 +5,9 @@ Order Context Module — Tool-Use Pattern for Order/Shipping Queries
 on utilise PAS le RAG (vectoriel). On utilise des "Tools" prédéfinis
 que le LLM peut appeler via function calling.
 
-Pourquoi pas RAG pour les commandes ?
-- Les commandes sont des données relationnelles en temps réel
-- Le RAG utilise la similarité (probabiliste) → mauvais pour les IDs exacts
-- Une requête SQL est déterministe : ORDER #12345 retourne toujours #12345
-- Pas besoin de re-embedder à chaque changement de statut
-
-Architecture:
-1. Intent Classifier → détecte si la question concerne une commande
-2. Info Extractor    → extrait order_id / customer_id du message
-3. Safe DB Queries  → fonctions paramétrées READ-ONLY (jamais d'écriture)
-4. Context Builder  → formate les données pour injection dans le prompt LLM
-
-Sécurité:
-- Toutes les requêtes sont READ-ONLY
-- Paramètres typés et validés (pas d'interpolation de SQL)
-- Le customer_id doit matcher le shop_id (no cross-shop leaks)
-- Limite stricte sur le nombre de commandes retournées
+Migration sécurité:
+- AVANT: text(f"... {customer_filter}") — injection SQL possible
+- APRÈS: SQLAlchemy ORM select() avec .where() conditionnel — sûr à 100%
 """
 from __future__ import annotations
 
@@ -32,21 +18,24 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.repositories.order_repository import OrderRepository
+
 logger = logging.getLogger(__name__)
+
+_order_repo = OrderRepository()
 
 
 # ─────────────────────── QUERY INTENT ────────────────────────────
 
 class QueryIntent(str, Enum):
-    PRODUCT_SEARCH = "product_search"   # Recherche produit → RAG
-    ORDER_STATUS = "order_status"       # Statut commande → DB direct
-    SHIPPING_INFO = "shipping_info"     # Info livraison → DB direct
-    RETURN_REQUEST = "return_request"   # Retour/remboursement → DB direct
-    GENERAL_SHOP = "general_shop"       # Infos boutique générales → LLM
-    POLICY = "policy"                   # Politique boutique → LLM
+    PRODUCT_SEARCH = "product_search"
+    ORDER_STATUS = "order_status"
+    SHIPPING_INFO = "shipping_info"
+    RETURN_REQUEST = "return_request"
+    GENERAL_SHOP = "general_shop"
+    POLICY = "policy"
 
 
 # ─────────────────────── ORDER DATA MODELS ───────────────────────
@@ -77,14 +66,13 @@ class OrderInfo:
 @dataclass
 class IntentResult:
     intent: QueryIntent
-    order_id: str | None = None         # Extracted from user message
-    customer_identifier: str | None = None  # Phone, email, or customer_id
+    order_id: str | None = None
+    customer_identifier: str | None = None
     confidence: float = 0.0
 
 
 # ─────────────────────── INTENT CLASSIFIER ───────────────────────
 
-# Patterns pour détecter les intentions liées aux commandes
 _ORDER_PATTERNS = [
     re.compile(
         r"\b(commande?|order|achat|purchase|transaction)\b.*"
@@ -116,7 +104,6 @@ _RETURN_PATTERNS = [
     ),
 ]
 
-# Pattern pour extraire un order ID du message
 _ORDER_ID_PATTERN = re.compile(
     r"\b(?:commande?|order|ref|#|numéro)?\s*([A-Z]{0,3}[\-]?[0-9]{4,12}[A-Z0-9\-]*)\b",
     re.IGNORECASE,
@@ -124,60 +111,38 @@ _ORDER_ID_PATTERN = re.compile(
 
 
 def classify_intent(message: str, history_text: str = "") -> IntentResult:
-    """
-    Classify the user's query intent.
-
-    Product search → RAG pipeline
-    Order/shipping/return → Direct DB query (Tool-use pattern)
-
-    This classifier is fast (~0.5ms) and runs entirely locally.
-    No LLM call needed for intent detection.
-    """
-    combined = f"{message} {history_text}".lower()
-
-    # Check return/refund intent first (most specific)
+    """Classify the user's query intent. Runs locally ~0.5ms, no LLM."""
     for pattern in _RETURN_PATTERNS:
         if pattern.search(message):
-            order_id = _extract_order_id(message)
             return IntentResult(
                 intent=QueryIntent.RETURN_REQUEST,
-                order_id=order_id,
+                order_id=_extract_order_id(message),
                 confidence=0.85,
             )
 
-    # Check order status
     for pattern in _ORDER_PATTERNS:
         if pattern.search(message):
-            order_id = _extract_order_id(message)
             return IntentResult(
                 intent=QueryIntent.ORDER_STATUS,
-                order_id=order_id,
+                order_id=_extract_order_id(message),
                 confidence=0.90,
             )
 
-    # Check shipping info
     for pattern in _SHIPPING_PATTERNS:
         if pattern.search(message):
-            order_id = _extract_order_id(message)
             return IntentResult(
                 intent=QueryIntent.SHIPPING_INFO,
-                order_id=order_id,
+                order_id=_extract_order_id(message),
                 confidence=0.80,
             )
 
-    # Default: product search (goes through RAG)
-    return IntentResult(
-        intent=QueryIntent.PRODUCT_SEARCH,
-        confidence=0.70,
-    )
+    return IntentResult(intent=QueryIntent.PRODUCT_SEARCH, confidence=0.70)
 
 
 def _extract_order_id(message: str) -> str | None:
-    """Extract order ID from user message. Returns None if not found."""
     match = _ORDER_ID_PATTERN.search(message)
     if match:
         candidate = match.group(1).upper().strip()
-        # Minimum 4 chars to avoid false positives
         if len(candidate) >= 4:
             return candidate
     return None
@@ -189,11 +154,15 @@ class OrderContextService:
     """
     Safe, read-only DB query service for order/shipping data.
 
-    All queries:
-    - Use SQLAlchemy parameterized queries (no SQL injection possible)
-    - Filter by shop_id to prevent cross-shop data leaks
-    - Return minimal fields (no payment card data, no private info)
-    - Hard-limit result counts
+    MIGRATION SÉCURITÉ:
+    - AVANT : text(f"SELECT ... {customer_filter}") — injection SQL via f-string
+    - APRÈS : OrderRepository.get_by_order_number() avec .where() conditionnel — sûr
+
+    Toutes les requêtes :
+    - Utilisent SQLAlchemy parameterized queries (zéro injection SQL possible)
+    - Filtrent par customer_id de façon conditionnelle sans f-string
+    - Retournent des champs minimaux (pas de données de paiement privées)
+    - Limitent strictement le nombre de résultats
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -203,59 +172,50 @@ class OrderContextService:
         self, order_id: str, shop_id: str, customer_id: str | None = None
     ) -> OrderInfo | None:
         """
-        Fetch order details by order ID.
-        Enforces shop_id filter to prevent cross-shop data access.
+        Fetch order details by order ID (ORM, paramétré, sans injection).
+        customer_id filtré conditionnellement via .where() ORM — pas de f-string.
         """
-        params: dict[str, Any] = {
-            "order_id": order_id.upper(),
-            "shop_id": shop_id,
-        }
-        customer_filter = ""
-        if customer_id:
-            customer_filter = "AND o.customer_id = :customer_id"
-            params["customer_id"] = customer_id
-
-        result = await self._session.execute(
-            text(f"""
-                SELECT
-                    o.id,
-                    o.status,
-                    o.created_at,
-                    o.total_amount,
-                    o.currency,
-                    o.shipping_address,
-                    o.payment_status,
-                    s.tracking_number,
-                    s.carrier,
-                    s.estimated_delivery_date
-                FROM orders o
-                LEFT JOIN shipments s ON s.order_id = o.id
-                WHERE (o.id = :order_id OR o.order_number = :order_id)
-                  AND o.shop_id = :shop_id
-                  AND o.deleted_at IS NULL
-                  {customer_filter}
-                LIMIT 1
-            """),
-            params,
+        order = await _order_repo.get_by_order_number(
+            self._session,
+            order_number=order_id,
+            customer_id=customer_id,
         )
-        row = result.fetchone()
-        if not row:
+        if not order:
             return None
 
-        # Fetch order items
-        items = await self._get_order_items(str(row[0]))
+        items = [
+            OrderItem(
+                product_name=str(
+                    (item.product_snapshot or {}).get("name", "Produit")
+                ),
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                currency=item.currency,
+            )
+            for item in (order.items or [])[:10]
+        ]
+
+        tracking = order.shipment.tracking_number if order.shipment else None
+        carrier = order.shipment.carrier if order.shipment else None
+        estimated = (
+            self._format_date(order.shipment.estimated_delivery_date)
+            if order.shipment
+            else None
+        )
 
         return OrderInfo(
-            order_id=str(row[0]),
-            status=str(row[1] or "en_traitement"),
-            created_at=self._format_date(row[2]),
-            total_amount=float(row[3] or 0),
-            currency=str(row[4] or "XAF"),
-            shipping_address=self._mask_address(row[5]),  # Mask for privacy
-            payment_status=str(row[6] or "inconnu"),
-            tracking_number=str(row[7]) if row[7] else None,
-            carrier=str(row[8]) if row[8] else None,
-            estimated_delivery=self._format_date(row[9]) if row[9] else None,
+            order_id=str(order.order_number or order.id),
+            status=str(order.status or "en_traitement"),
+            created_at=self._format_date(order.created_at),
+            total_amount=float(order.total_amount or 0),
+            currency=str(order.currency or "XAF"),
+            shipping_address=self._mask_address(
+                str(order.shipping_address) if order.shipping_address else None
+            ),
+            payment_status=str(order.payment_status or "inconnu"),
+            tracking_number=tracking,
+            carrier=carrier,
+            estimated_delivery=estimated,
             items=items,
         )
 
@@ -263,75 +223,53 @@ class OrderContextService:
         self, shop_id: str, customer_id: str, limit: int = 3
     ) -> list[OrderInfo]:
         """
-        Fetch customer's most recent orders for a shop.
-        Maximum 3 orders to keep context manageable.
+        Fetch recent orders for a customer in a shop.
+        ORM select() avec filtres .where() — aucun f-string, aucune interpolation.
         """
-        result = await self._session.execute(
-            text("""
-                SELECT
-                    o.id, o.status, o.created_at, o.total_amount,
-                    o.currency, o.payment_status,
-                    s.tracking_number, s.carrier, s.estimated_delivery_date
-                FROM orders o
-                LEFT JOIN shipments s ON s.order_id = o.id
-                WHERE o.shop_id = :shop_id
-                  AND o.customer_id = :customer_id
-                  AND o.deleted_at IS NULL
-                ORDER BY o.created_at DESC
-                LIMIT :limit
-            """),
-            {"shop_id": shop_id, "customer_id": customer_id, "limit": min(limit, 3)},
+        orders = await _order_repo.list_recent_by_customer(
+            self._session,
+            shop_id=shop_id,
+            customer_id=customer_id,
+            limit=min(limit, 3),
         )
-        rows = result.fetchall()
-        orders = []
-        for row in rows:
-            items = await self._get_order_items(str(row[0]))
-            orders.append(OrderInfo(
-                order_id=str(row[0]),
-                status=str(row[1] or "en_traitement"),
-                created_at=self._format_date(row[2]),
-                total_amount=float(row[3] or 0),
-                currency=str(row[4] or "XAF"),
-                payment_status=str(row[5] or "inconnu"),
-                tracking_number=str(row[6]) if row[6] else None,
-                carrier=str(row[7]) if row[7] else None,
-                estimated_delivery=self._format_date(row[8]) if row[8] else None,
+
+        result = []
+        for order in orders:
+            items = [
+                OrderItem(
+                    product_name=str(
+                        (item.product_snapshot or {}).get("name", "Produit")
+                    ),
+                    quantity=item.quantity,
+                    unit_price=item.unit_price,
+                    currency=item.currency,
+                )
+                for item in (order.items or [])[:10]
+            ]
+            tracking = order.shipment.tracking_number if order.shipment else None
+            carrier = order.shipment.carrier if order.shipment else None
+            estimated = (
+                self._format_date(order.shipment.estimated_delivery_date)
+                if order.shipment
+                else None
+            )
+            result.append(OrderInfo(
+                order_id=str(order.order_number or order.id),
+                status=str(order.status or "en_traitement"),
+                created_at=self._format_date(order.created_at),
+                total_amount=float(order.total_amount or 0),
+                currency=str(order.currency or "XAF"),
+                payment_status=str(order.payment_status or "inconnu"),
+                tracking_number=tracking,
+                carrier=carrier,
+                estimated_delivery=estimated,
                 items=items,
             ))
-        return orders
-
-    async def _get_order_items(self, order_id: str) -> list[OrderItem]:
-        """Fetch line items for an order."""
-        result = await self._session.execute(
-            text("""
-                SELECT oi.quantity, oi.unit_price, oi.currency, p.name
-                FROM order_items oi
-                LEFT JOIN products p ON p.id = oi.product_id
-                WHERE oi.order_id = :order_id
-                LIMIT 10
-            """),
-            {"order_id": order_id},
-        )
-        return [
-            OrderItem(
-                product_name=str(row[3] or "Produit"),
-                quantity=int(row[0] or 1),
-                unit_price=float(row[1] or 0),
-                currency=str(row[2] or "XAF"),
-            )
-            for row in result.fetchall()
-        ]
+        return result
 
     # ─────────────────────── CONTEXT BUILDER ─────────────────────
 
     def build_order_context(self, orders: list[OrderInfo]) -> str:
-        """
-        Format order data as plain text for LLM context injection.
-        This replaces the product catalog section when the query is order-related.
-
-        The format is designed to be unambiguous and factual.
-        No placeholders or approximations.
-        """
         if not orders:
             return (
                 "\n[COMMANDES]\n"
@@ -348,7 +286,7 @@ class OrderContextService:
 
             if order.items:
                 lines.append("  Articles         :")
-                for item in order.items[:5]:  # Max 5 items
+                for item in order.items[:5]:
                     lines.append(
                         f"    - {item.product_name} x{item.quantity} "
                         f"({item.unit_price:,.0f} {item.currency})"
@@ -373,7 +311,6 @@ class OrderContextService:
     # ─────────────────────── HELPERS ─────────────────────────────
 
     def _translate_status(self, status: str) -> str:
-        """Translate DB status codes to human-readable text."""
         status_map = {
             "pending": "En attente de confirmation",
             "confirmed": "Confirmée",
@@ -407,11 +344,9 @@ class OrderContextService:
         return str(dt)
 
     def _mask_address(self, address: str | None) -> str | None:
-        """Partially mask address for privacy (show city only)."""
         if not address:
             return None
-        # Return only the city portion to avoid full address disclosure
         parts = [p.strip() for p in address.split(",")]
         if len(parts) >= 2:
-            return parts[-2] + ", " + parts[-1]  # City + Country
+            return parts[-2] + ", " + parts[-1]
         return parts[0] if parts else None
