@@ -135,7 +135,8 @@ class RankingPipeline:
         FAISS ANN search depuis le user embedding.
         Returns liste de item_ids.
         """
-        loop = asyncio.get_event_loop()
+        # M-03/H-08 FIX: get_event_loop() déprécié Python 3.10+
+        loop = asyncio.get_running_loop()
         query = np.array(session_vector, dtype=np.float32).reshape(1, -1)
         item_ids, _ = await loop.run_in_executor(
             None, lambda: self.faiss_index.search(query, k)
@@ -155,7 +156,7 @@ class RankingPipeline:
         """
         DeepFM léger pour filtrer 2000 → 400 items.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()  # M-03/H-08 FIX
         try:
             scores = await loop.run_in_executor(
                 None,
@@ -168,7 +169,7 @@ class RankingPipeline:
             )
             return [iid for iid, _ in sorted_ids[:top_k]]
         except Exception as e:
-            logger.warning(f"DeepFM pre-rank failed: {e}, using raw candidates")
+            logger.warning("DeepFM pre-rank failed: %s, using raw candidates", e)
             return candidates[:top_k]
 
     # ─── Étape 3 : MTL/PLE scoring (<30ms) ─────────────────────────────────
@@ -184,7 +185,7 @@ class RankingPipeline:
         MTL/PLE: score les 7 objectifs simultanément.
         Retourne {item_id: {task: score}}
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()  # M-03/H-08 FIX
         try:
             raw_scores = await loop.run_in_executor(
                 None,
@@ -197,8 +198,9 @@ class RankingPipeline:
             )
             return raw_scores
         except Exception as e:
-            logger.warning(f"MTL scoring failed: {e}, using popularity-based fallback")
-            return self._popularity_fallback(candidates)
+            logger.warning("MTL scoring failed: %s, using popularity-based fallback", e)
+            # H-08 FIX: _popularity_fallback est maintenant async
+            return await self._popularity_fallback(candidates)
 
     def _compute_commerce_score(self, mtl_scores: dict, context: str = "marketplace") -> float:
         """Σ (task_weight × prediction) — context-aware scoring.
@@ -213,38 +215,37 @@ class RankingPipeline:
             for task in weights
         )
 
-    def _popularity_fallback(self, candidates: list[str]) -> dict[str, dict]:
+    async def _popularity_fallback(self, candidates: list[str]) -> dict[str, dict]:
         """Popularity-based MTL fallback — uses Redis impression counts.
 
-        Instead of giving identical scores to every item (which makes ranking
-        random), we use each item's impression count as a proxy for quality.
-        More-seen items get slightly higher base scores, creating a meaningful
-        ranking even when the MTL model is unavailable.
+        H-08 FIX: Cette méthode était synchrone (def) mais appelait
+        loop.run_until_complete() depuis un contexte async actif → RuntimeError
+        "This event loop is already running" — crash silencieux.
+
+        Conversion en async def + await direct. Redis asyncio ne nécessite
+        pas de boucle manuelle.
         """
         fallback = {}
         impressions = {}
 
-        # Try to fetch real popularity data from Redis
+        # H-08 FIX: await direct sur le pipeline Redis async
         if self.redis:
             try:
-                import asyncio
-                loop = asyncio.get_event_loop()
                 pipe = self.redis.pipeline()
                 for iid in candidates:
                     pipe.get(f"item:{iid}:impressions")
-                values = loop.run_until_complete(pipe.execute()) if pipe else []
+                values = await pipe.execute()  # await direct dans async def
                 for iid, val in zip(candidates, values):
                     impressions[iid] = int(val) if val else 0
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Popularity fallback Redis error: %s", e)
 
         max_imp = max(impressions.values()) if impressions else 1
 
         for i, iid in enumerate(candidates):
-            # Normalize impression count to 0-1 range, with position decay
             pop_score = impressions.get(iid, 0) / max(max_imp, 1)
             position_decay = 1.0 - (i / max(len(candidates), 1)) * 0.1
-            base = 0.01 + pop_score * 0.04  # Range: 0.01 → 0.05
+            base = 0.01 + pop_score * 0.04
 
             fallback[iid] = {
                 "p_buy_now": base * 0.5 * position_decay,
@@ -435,7 +436,7 @@ class RankingPipeline:
                 )
 
         except Exception as e:
-            logger.warning(f"Cross-sell injection failed: {e}")
+            logger.warning("Cross-sell injection failed: %s", e)
         return result
 
     # ─── Pipeline principal ──────────────────────────────────────────────────

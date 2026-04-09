@@ -227,9 +227,23 @@ class MTLModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # M-01 FIX: Kaiming uniform (He init) est conçu pour ReLU/GELU.
+        # Les task heads (output sigmoid) doivent utiliser Xavier/Glorot
+        # qui suppose une activation symétrique (Glorot & Bengio, 2010).
+        # Appliquer Kaiming sur les couches sigmoid fausse les gradients initiaux.
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                # Vérifier si c'est un task head (output dim=1) → Xavier
+                # Les task heads ont out_features=1 et sont dans self.task_heads
+                is_task_head = any(
+                    module is head for head in self.task_heads.values()
+                )
+                if is_task_head:
+                    # Xavier/Glorot uniform: pour les couches de sortie sigmoid
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)
+                else:
+                    # Kaiming (He) pour les couches intermédiaires ReLU/GELU
+                    nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 

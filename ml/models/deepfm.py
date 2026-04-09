@@ -96,8 +96,14 @@ class DeepFM(nn.Module):
         fm_embedding_dim: int = 16,
         dnn_hidden_dims: tuple[int, ...] = (512, 256, 128),
         dropout: float = 0.1,
+        # H-07 FIX: n_sparse_fields était hardcodé à 20 dans le DNN input dim.
+        # Si on avait 18 ou 25 features sparse, le modèle acceptait quand même
+        # et produisait des shapes incorrectes silencieusement.
+        # On paramétrise et on valide dans forward().
+        n_sparse_fields: int = 20,
     ):
         super().__init__()
+        self.n_sparse_fields = n_sparse_fields
         # First-order linear weights for sparse features
         self.linear = nn.Embedding(num_sparse_features, 1)
 
@@ -108,14 +114,12 @@ class DeepFM(nn.Module):
         self.dense_proj = nn.Linear(dense_input_dim, 128)
 
         # DNN component — concatenated sparse embeddings + dense
-        sparse_dnn_input = num_sparse_features * fm_embedding_dim  # Flattened
-        # Use separate embedding for DNN to avoid coupling with FM
         self.sparse_embedding = nn.Embedding(num_sparse_features, fm_embedding_dim)
-        dnn_input_dim = 128 + fm_embedding_dim * 20  # top-20 sparse features
+        # H-07 FIX: dnn_input_dim dépend du n_sparse_fields paramétrisé, pas 20 hardcodé
+        dnn_input_dim = 128 + fm_embedding_dim * n_sparse_fields
         self.dnn = DNNLayer(dnn_input_dim, dnn_hidden_dims, dropout)
 
         # Final prediction head
-        # FM output (1) + DNN output (last hidden dim) + linear output (1)
         self.head = nn.Linear(1 + self.dnn.output_dim + 1, 1)
 
         self._init_weights()
@@ -152,9 +156,19 @@ class DeepFM(nn.Module):
 
         # DNN: high-order interactions
         sparse_emb = self.sparse_embedding(sparse_indices)  # (B, F, E)
-        # Flatten and take top-K
         B = sparse_emb.size(0)
-        sparse_flat = sparse_emb[:, :20, :].reshape(B, -1)  # (B, 20*E)
+        n = self.n_sparse_fields  # H-07 FIX: utilise le paramètre, pas 20 hardcodé
+
+        # H-07 FIX: Valider que le batch a assez de features sparse
+        actual_fields = sparse_emb.size(1)
+        if actual_fields < n:
+            raise ValueError(
+                f"DeepFM expected at least {n} sparse fields, got {actual_fields}. "
+                f"Rebuild the model with n_sparse_fields={actual_fields} or "
+                f"pad sparse_indices to {n} fields."
+            )
+
+        sparse_flat = sparse_emb[:, :n, :].reshape(B, -1)  # (B, n*E)
         dense_proj = self.dense_proj(dense_features)          # (B, 128)
         dnn_input = torch.cat([dense_proj, sparse_flat], dim=-1)
         dnn_out = self.dnn(dnn_input)  # (B, last_hidden)

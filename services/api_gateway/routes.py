@@ -13,6 +13,7 @@ Migration: asyncpg brut conn.fetchrow() → UserRepository (SQLAlchemy 2.0)
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.db.session import get_db
 from shared.repositories.user_repository import UserRepository
+from shared.security.headers import add_security_headers  # H-10 FIX
 
 from .auth import create_access_token, pwd_context, verify_token
 from .rate_limiter import RateLimiter
@@ -35,13 +37,25 @@ app = FastAPI(
     description="Central entry point for the ShopFeed OS platform.",
 )
 
+# C-01 FIX: allow_origins=["*"] + allow_credentials=True est interdit par la spec CORS.
+# Les navigateurs rejettent silencieusement les requêtes credentialed vers un wildcard.
+# On charge les origines autorisées depuis une variable d'env pour chaque déploiement.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,          # Jamais ["*"] avec credentials
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-User-ID", "X-Session-ID"],
+    expose_headers=["X-Request-ID"],
+    max_age=600,
 )
+
+# H-10 FIX: Injecter HSTS, CSP, X-Frame-Options, Referrer-Policy, etc.
+# Doit être appelé APRÈS add_middleware(CORSMiddleware).
+add_security_headers(app)
 
 rate_limiter = RateLimiter(redis_client=None, max_requests=100, window_seconds=60)
 

@@ -46,6 +46,9 @@ elasticsearch[async]>=8.16.0
 # ── Auth & Security ─────────────────────────────────────
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
+pydantic[email]>=2.9.0      # H-02 FIX: EmailStr pour validation email (email-validator)
+secweb>=1.30.10             # H-10 FIX: Security headers (HSTS, CSP, X-Frame-Options, etc.)
+aiobreaker>=1.2.0           # H-11 FIX: Circuit Breakers async pour les appels inter-services
 
 # ── HTTP & Networking ───────────────────────────────────
 httpx>=0.27.0

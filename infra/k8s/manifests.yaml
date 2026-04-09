@@ -1,5 +1,12 @@
-# ShopFeed OS — Kubernetes Manifests
-# Section 11 — Stack Technique
+# ShopFeed OS — Kubernetes Manifests (Production Hardened)
+# M-05, M-06, M-08, H-04 FIX
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets Reference (à créer manuellement)
+# kubectl create secret generic shopfeed-secrets \
+#   --from-literal=jwt-secret=$(openssl rand -hex 32) \
+#   --from-literal=ml-service-token=$(openssl rand -hex 32)
+# ─────────────────────────────────────────────────────────────────────────────
 
 apiVersion: apps/v1
 kind: Deployment
@@ -18,6 +25,12 @@ spec:
       labels:
         service: api-gateway
     spec:
+      # M-06 FIX: runAsNonRoot — ne jamais tourner en root dans les pods
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: api-gateway
           image: shopfeed/api-gateway:latest
@@ -31,6 +44,10 @@ spec:
                   key: jwt-secret
             - name: REDIS_URL
               value: redis://redis-rate:6381/0
+            - name: APP_ENV
+              value: production
+            - name: ALLOWED_ORIGINS
+              value: "https://app.shopfeed.io,https://vendor.shopfeed.io"
           resources:
             requests:
               cpu: "250m"
@@ -38,18 +55,34 @@ spec:
             limits:
               cpu: "1000m"
               memory: "512Mi"
+          # M-06 FIX: securityContext par container
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp   # Requis si readOnlyRootFilesystem: true
+          # M-05 FIX: Liveness & Readiness probes
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 15
             periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
 
 ---
 apiVersion: apps/v1
@@ -69,6 +102,12 @@ spec:
       labels:
         service: feed-service
     spec:
+      # M-06 FIX
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: feed-service
           image: shopfeed/feed-service:latest
@@ -79,6 +118,13 @@ spec:
               value: redis://redis-session:6379/0
             - name: KAFKA_BOOTSTRAP
               value: kafka:9092
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shopfeed-secrets
+                  key: jwt-secret
+            - name: USER_SERVICE_URL
+              value: "http://user-service:8001"  # M-04 FIX: K8s DNS interne
           resources:
             requests:
               cpu: "500m"
@@ -86,6 +132,34 @@ spec:
             limits:
               cpu: "2000m"
               memory: "1Gi"
+          # M-06 FIX
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # M-05 FIX: Probes manquantes sur feed-service
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
 
 ---
 apiVersion: apps/v1
@@ -105,6 +179,12 @@ spec:
       labels:
         service: live-service
     spec:
+      # M-06 FIX
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: live-service
           image: shopfeed/live-service:latest
@@ -117,6 +197,115 @@ spec:
             limits:
               cpu: "2000m"
               memory: "1Gi"
+          # M-06 FIX
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # M-05 FIX: Probes manquantes sur live-service
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+# M-08 FIX: ML Inference Service — deployment manquant dans les manifests
+# initialDelaySeconds élevé (60s) pour le chargement des modèles PyTorch/FAISS
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-inference
+  labels:
+    app: shopfeed
+    service: ml-inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      service: ml-inference
+  template:
+    metadata:
+      labels:
+        service: ml-inference
+    spec:
+      # ML inference tourne sur GPU — runAsNonRoot reste obligatoire
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: ml-inference
+          image: shopfeed/ml-inference:latest
+          ports:
+            - containerPort: 8100
+          env:
+            - name: ML_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: shopfeed-secrets
+                  key: ml-service-token
+            - name: APP_ENV
+              value: production
+            - name: FRAUD_MODEL_PATH
+              value: /models/fraud_lgbm.pkl
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "4Gi"
+            limits:
+              cpu: "8000m"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"       # 1 GPU par pod
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          # M-08 FIX: Probes avec délai adapté au chargement des modèles ML
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8100
+            initialDelaySeconds: 60   # PyTorch + FAISS + LightGBM chargement
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8100
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ml-models-pvc
+        - name: tmp
+          emptyDir: {}
 
 ---
 # HPA for Feed Service (most critical for latency)
@@ -147,7 +336,25 @@ spec:
           averageValue: "80m"   # Scale up when >80ms p95
 
 ---
-# Ingress
+# H-04 FIX: TLS avec cert-manager + Let's Encrypt
+# Prérequis: kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@shopfeed.io   # CHANGER en email réel
+    privateKeySecretRef:
+      name: letsencrypt-prod-pk
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+
+---
+# H-04 FIX: Ingress avec TLS automatique via cert-manager
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -156,7 +363,17 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     nginx.ingress.kubernetes.io/websocket-services: "live-service,feed-service"
+    # H-04 FIX: cert-manager gère le certificat TLS automatiquement
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:
+  ingressClassName: nginx
+  # H-04 FIX: TLS — cert-manager va créer et renouveler le certificat
+  tls:
+    - hosts:
+        - api.shopfeed.io
+      secretName: shopfeed-tls-cert   # Secret créé automatiquement par cert-manager
   rules:
     - host: api.shopfeed.io
       http:
@@ -182,3 +399,76 @@ spec:
                 name: api-gateway
                 port:
                   number: 8000
+
+---
+# M-06 FIX: NetworkPolicy Zero Trust — un pod ne peut recevoir du trafic
+# que des sources explicitement autorisées. Par défaut tout est DENY.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-netpol
+spec:
+  podSelector:
+    matchLabels:
+      service: api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx   # Uniquement depuis le load balancer
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              service: redis-rate
+      ports:
+        - protocol: TCP
+          port: 6381
+    - to:
+        - podSelector:
+            matchLabels:
+              service: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - ports:
+        - protocol: UDP
+          port: 53    # DNS
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ml-inference-netpol
+spec:
+  podSelector:
+    matchLabels:
+      service: ml-inference
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: shopfeed    # Uniquement les pods ShopFeed authentifiés
+      ports:
+        - protocol: TCP
+          port: 8100
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              service: redis-ml
+      ports:
+        - protocol: TCP
+          port: 6380
+    - ports:
+        - protocol: UDP
+          port: 53    # DNS

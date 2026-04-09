@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import time
 import asyncio
+import uuid as _uuid
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -56,6 +57,7 @@ from ml.inference.schemas import (
     AssociatedSearchRequest, AssociatedSearchResponse,
     AssociatedVideo, AssociatedProductItem, RetrievalCounts,
 )
+from ml.inference.auth import verify_service_token
 from ml.inference.health import get_health
 from ml.inference.pipeline import RankingPipeline
 
@@ -67,6 +69,10 @@ _registry = None
 _faiss_index = None
 _pipeline: RankingPipeline | None = None
 _start_time = time.time()
+
+# M-02 FIX: FraudDetector singleton — instancier à chaque requête recharge
+# LightGBM à chaque appel, ce qui est ~100ms de surcoût inutile.
+_fraud_detector = None
 
 # Gap 1-5: Search module globals
 _visual_search = None
@@ -106,6 +112,24 @@ async def lifespan(app: FastAPI):
         faiss_index=_faiss_index,
         redis_client=None,  # injecté si Redis disponible
     )
+
+    # M-02 FIX: Singleton FraudDetector — chargé une fois au startup
+    global _fraud_detector
+    try:
+        from ml.fraud.detector import FraudDetector
+        fraud_model_path = os.getenv("FRAUD_MODEL_PATH")
+        _fraud_detector = FraudDetector(model_path=fraud_model_path) if fraud_model_path else FraudDetector()
+        if fraud_model_path and getattr(_fraud_detector, "model", None):
+            logger.info("FraudDetector loaded: %s (LightGBM)", fraud_model_path)
+        else:
+            logger.warning("FraudDetector: no model path or model failed — using rule-based fallback")
+    except Exception as e:
+        logger.warning("FraudDetector init failed: %s — using rule-based fallback", e)
+        try:
+            from ml.fraud.detector import FraudDetector
+            _fraud_detector = FraudDetector()
+        except Exception:
+            _fraud_detector = None
 
     # ── Gap 1-5 + 15% completions: Initialize search modules ─────────
     global _visual_search, _hybrid_search, _cross_modal, _search_reranker, _category_router
@@ -185,11 +209,16 @@ async def lifespan(app: FastAPI):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+import os  # noqa: E402 — requis ici pour FRAUD_MODEL_PATH dans lifespan
+
 app = FastAPI(
     title="ShopFeed OS — ML Inference API",
     version="1.0.0",
     description="Pont ML ↔ shop-backend. SLA global <200ms.",
     lifespan=lifespan,
+    # C-02 FIX: Applique verify_service_token à TOUS les endpoints.
+    # Seuls /v1/health et /health sont exemptés (logique dans le middleware).
+    dependencies=[Depends(verify_service_token)],
 )
 
 
@@ -203,6 +232,13 @@ def get_registry():
     if _registry is None:
         raise HTTPException(status_code=503, detail="Model registry not loaded")
     return _registry
+
+
+# M-02 FIX: Dependency FastAPI pour le FraudDetector singleton
+def get_fraud_detector():
+    if _fraud_detector is None:
+        raise HTTPException(status_code=503, detail="Fraud detector not ready")
+    return _fraud_detector
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,7 +430,9 @@ async def embed_user(
     Calcule l'embedding user 256d via le user tower Two-Tower.
     Stocké dans Redis ml_user_features:{user_id} (TTL 3600).
     """
-    loop = asyncio.get_event_loop()
+    # M-03 FIX: get_event_loop() déprécié Python 3.10+ — utiliser get_running_loop()
+    # dans un handler async FastAPI, la boucle est toujours en cours d'exécution.
+    loop = asyncio.get_running_loop()
 
     try:
         from ml.feature_store.pipeline import user_to_features
@@ -454,7 +492,7 @@ async def embed_product(
     4. CLIP zero-shot → category verification
     """
     t_start = time.perf_counter()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # M-03 FIX
 
     clip_embedding = []
     cv_score = 0.5
@@ -545,7 +583,7 @@ async def session_intent_vector(
     Encode la séquence d'actions session en vecteur d'intent 128d.
     Stocké dans Redis ml_session_intent:{session_id} (TTL 1800).
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # M-03 FIX
     actions = [a.model_dump() for a in request.session_actions]
 
     # Calcul du vecteur d'intent via BST
@@ -636,7 +674,7 @@ async def moderation_clip_check(
     Si le produit est flaggé (match=False), utilise Llama 4 Scout pour
     expliquer POURQUOI → transparence pour les vendeurs.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # M-03 FIX
     try:
         from ml.cv.category_verifier import verify_category
         result = await loop.run_in_executor(
@@ -840,7 +878,12 @@ async def ads_serve(request: AdServeRequest) -> AdServeResponse:
             placement_slots=request.placement_slots,
             context=request.context,
         )
-        result = await engine.serve(eps_request)
+        # H-09 FIX: EpsilonEngine.serve() est synchrone (utilise redis sync).
+        # Appel direct depuis async == blocage de l'event loop FastAPI sous charge.
+        # run_in_executor() délègue au thread pool pour ne pas bloquer.
+        # Solution long-terme : migrer EpsilonEngine vers redis.asyncio.
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, engine.serve, eps_request)
         pipeline_ms = (time.perf_counter() - t_start) * 1000
         return AdServeResponse(
             ads=[ServedAd(**ad) for ad in result.get("ads", [])],
@@ -848,7 +891,7 @@ async def ads_serve(request: AdServeRequest) -> AdServeResponse:
             pipeline_ms=pipeline_ms,
         )
     except Exception as e:
-        logger.error(f"EPSILON ad serve failed: {e}")
+        logger.error("EPSILON ad serve failed: %s", e)
         return AdServeResponse(pipeline_ms=(time.perf_counter() - t_start) * 1000)
 
 
@@ -862,17 +905,19 @@ async def ads_serve(request: AdServeRequest) -> AdServeResponse:
     summary="LightGBM fraud detection — bots, fake engagement, card fraud",
     tags=["Moderation"],
 )
-async def fraud_check(request: FraudCheckRequest) -> FraudCheckResponse:
+async def fraud_check(
+    request: FraudCheckRequest,
+    detector=Depends(get_fraud_detector),  # M-02 FIX: singleton injecté
+) -> FraudCheckResponse:
     """Real-time fraud scoring via LightGBM + velocity rules.
 
     Score > 0.9 → shadowban + investigation
     Score > 0.7 → captcha challenge
     Score < 0.3 → allow
     """
-    loop = asyncio.get_event_loop()
+    # M-03 FIX: get_running_loop() (get_event_loop déprécié Python 3.10+)
+    loop = asyncio.get_running_loop()
     try:
-        from ml.fraud.detector import FraudDetector
-        detector = FraudDetector()
         result = await loop.run_in_executor(
             None,
             lambda: detector.check(
@@ -894,7 +939,7 @@ async def fraud_check(request: FraudCheckRequest) -> FraudCheckResponse:
             velocity_alert=result.get("velocity_alert", False),
         )
     except Exception as e:
-        logger.error(f"Fraud check failed: {e}")
+        logger.error("Fraud check failed: %s", e)
         return FraudCheckResponse(fraud_score=0.0, decision="allow")
 
 
@@ -955,7 +1000,7 @@ async def moderation_duplicate_check(
     Uses perceptual hashing (pHash). Hamming distance ≤ 8 = duplicate.
     """
     t_start = time.perf_counter()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # M-03 FIX
     try:
         from ml.cv.duplicate_detector import compute_phash, find_duplicates_in_batch
         phash = await loop.run_in_executor(
@@ -1363,10 +1408,13 @@ async def search_autocomplete(prefix: str, limit: int = 5):
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request, exc):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    # H-01 FIX: Ne jamais exposer str(exc) au client — révèle la stack interne.
+    # On retourne un trace_id opaque pour corréler avec les logs sans leak d'info.
+    trace_id = str(_uuid.uuid4())[:8]
+    logger.error("Unhandled exception [%s]: %s", trace_id, exc, exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal ML server error", "error": str(exc)},
+        content={"detail": "Internal server error", "trace_id": trace_id},
     )
 
 

@@ -122,23 +122,27 @@ class MoELayer(nn.Module):
         variance = ((expert_counts - mean_count) ** 2).mean()
         self.last_balance_loss = self.balance_coeff * (variance / (mean_count ** 2 + 1e-8))
 
-        # ── Expert computation ───────────────────────────────
-        out = torch.zeros(N, list(self.experts[0].parameters())[1].shape[0],
-                          device=flat.device, dtype=flat.dtype)
-        # Determine output dim from last linear in each expert
+        # ── Expert computation (H-06 FIX: vectorisé) ────────────────────────
+        # Avant: double for-loop O(K×E) Python appels GPU — chaque experts[e](flat[mask])
+        # lançait un kernel CUDA séparé + CPU↔GPU sync via mask.any().
+        # Après: 1 torch.stack → tous experts en parallèle, puis gather + pondération.
+
+        # Étape 1: Calculer TOUS les experts sur flat en parallèle → [E, N, output_dim]
         output_dim = self.experts[0][-1].out_features
-        out = torch.zeros(N, output_dim, device=flat.device, dtype=flat.dtype)
+        all_expert_outs = torch.stack(
+            [expert(flat) for expert in self.experts], dim=0
+        )  # [E, N, output_dim]
 
-        for k_idx in range(self.top_k):
-            expert_idx = topk_indices[:, k_idx]    # [N] — which expert per token
-            weight     = topk_weights[:, k_idx]    # [N] — its weight
+        # Étape 2: Gather les top-K sorties par token
+        # topk_indices: [N, K] → selected[k, n, :] = all_expert_outs[topk_indices[n,k], n, :]
+        ei = topk_indices.t().unsqueeze(-1).expand(
+            self.top_k, N, output_dim
+        )  # [K, N, output_dim]
+        selected = all_expert_outs.gather(0, ei)  # [K, N, output_dim]
 
-            for e_id in range(self.num_experts):
-                mask = (expert_idx == e_id)
-                if not mask.any():
-                    continue
-                expert_out = self.experts[e_id](flat[mask])       # [M, output_dim]
-                out[mask] += weight[mask].unsqueeze(-1) * expert_out
+        # Étape 3: Pondérer par topk_weights et sommer sur K → [N, output_dim]
+        weights = topk_weights.t().unsqueeze(-1)   # [K, N, 1]
+        out = (selected * weights).sum(dim=0)       # [N, output_dim]
 
         # ── Shared expert (always active) ────────────────────
         shared_out = self.shared_expert(flat)     # [N, output_dim]
